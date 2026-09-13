@@ -1,0 +1,48 @@
+{
+  "project_info": {
+    "project_number": "580976539578",
+    "project_id": "poss-66570",
+    "storage_bucket": "poss-66570.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:580976539578:android:7c45d5c8e1299af8644f83",
+        "android_client_info": {
+          "package_name": "com.techheracles.manager_app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyC-QiLLwOIVpK1FC_oMjPK9Gz322xAOsWw"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:580976539578:android:f3b5d089035b6729644f83",
+        "android_client_info": {
+          "package_name": "com.techheracles.pos_app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyC-QiLLwOIVpK1FC_oMjPK9Gz322xAOsWw"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
