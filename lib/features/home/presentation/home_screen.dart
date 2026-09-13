@@ -16,7 +16,7 @@ class HomeScreen extends ConsumerWidget {
 
     return Scaffold(
       appBar: AppBar(
-        title: Text(paired?.businessUnitName ?? 'POS'),
+        title: Text(paired?.businessUnitName ?? 'AVEC Operations'),
         actions: [
           IconButton(
             icon: const Icon(Icons.logout),

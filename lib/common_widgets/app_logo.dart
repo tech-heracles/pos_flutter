@@ -1,9 +1,10 @@
 import 'package:flutter/material.dart';
 import '../app/theme.dart';
 
-/// Merged P + I + L monogram, matching the Manager app's mark.
-class PilMark extends StatelessWidget {
-  const PilMark({
+/// The AVEC mark: "A" (apex up) stacked over "V" (apex down) with a thin
+/// gap, tracing an implied diamond from the brand's first two letters.
+class AvecMark extends StatelessWidget {
+  const AvecMark({
     super.key,
     this.size = 44,
     this.markColor,
@@ -16,21 +17,28 @@ class PilMark extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return CustomPaint(
-      size: Size(size, size),
-      painter: _PilMarkPainter(
-        markColor: markColor ?? AppColors.orangeOn,
-        backgroundColor: backgroundColor ?? AppColors.orange,
+    return Container(
+      width: size,
+      height: size,
+      decoration: BoxDecoration(
+        color: backgroundColor ?? AppColors.orange,
+        borderRadius: BorderRadius.circular(size * 0.2),
+      ),
+      child: CustomPaint(
+        size: Size(size, size),
+        painter: _AvecMarkPainter(
+          markColor: markColor ?? AppColors.orangeOn,
+        ),
       ),
     );
   }
 }
 
-class _PilMarkPainter extends CustomPainter {
-  _PilMarkPainter({required this.markColor, required this.backgroundColor});
+class _AvecMarkPainter extends CustomPainter {
+  _AvecMarkPainter({required this.markColor});
   final Color markColor;
-  final Color backgroundColor;
 
+  // Design grid is 240x240 — everything below scales to the actual size.
   static const double _grid = 240;
 
   @override
@@ -38,47 +46,31 @@ class _PilMarkPainter extends CustomPainter {
     final scale = size.width / _grid;
     canvas.scale(scale, scale);
 
-    final bgPaint = Paint()..color = backgroundColor;
     final markPaint = Paint()..color = markColor;
 
-    final badge = RRect.fromRectAndRadius(
-      const Rect.fromLTWH(20, 20, 200, 200),
-      const Radius.circular(48),
-    );
-    canvas.drawRRect(badge, bgPaint);
-
-    final stem = RRect.fromRectAndRadius(
-      const Rect.fromLTWH(75, 50, 24, 140),
-      const Radius.circular(12),
-    );
-    canvas.drawRRect(stem, markPaint);
-
-    final bowl = Path()
-      ..moveTo(99, 50)
-      ..lineTo(131, 50)
-      ..arcToPoint(
-        const Offset(131, 114),
-        radius: const Radius.circular(32),
-      )
-      ..lineTo(99, 114)
+    final topTriangle = Path()
+      ..moveTo(120, 40)
+      ..lineTo(58, 128)
+      ..lineTo(182, 128)
       ..close();
-    canvas.drawPath(bowl, markPaint);
+    canvas.drawPath(topTriangle, markPaint);
 
-    final foot = RRect.fromRectAndRadius(
-      const Rect.fromLTWH(75, 168, 90, 22),
-      const Radius.circular(11),
-    );
-    canvas.drawRRect(foot, markPaint);
+    final bottomTriangle = Path()
+      ..moveTo(58, 138)
+      ..lineTo(182, 138)
+      ..lineTo(120, 226)
+      ..close();
+    canvas.drawPath(bottomTriangle, markPaint);
   }
 
   @override
-  bool shouldRepaint(covariant _PilMarkPainter oldDelegate) {
-    return oldDelegate.markColor != markColor ||
-        oldDelegate.backgroundColor != backgroundColor;
+  bool shouldRepaint(covariant _AvecMarkPainter oldDelegate) {
+    return oldDelegate.markColor != markColor;
   }
 }
 
-/// The lockup used across the POS app: PilMark + "POS" wordmark.
+/// The lockup used across the Operations (POS) app: AvecMark + "AVEC
+/// OPERATIONS" wordmark, matching Manager's lockup style.
 class AppLogo extends StatelessWidget {
   const AppLogo({super.key, this.markSize = 40});
   final double markSize;
@@ -88,15 +80,28 @@ class AppLogo extends StatelessWidget {
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
-        PilMark(size: markSize),
+        AvecMark(size: markSize),
         SizedBox(width: markSize * 0.3),
-        Text(
-          'POS',
-          style: TextStyle(
-            fontSize: markSize * 0.42,
-            fontWeight: FontWeight.w800,
-            letterSpacing: markSize * 0.06,
-            color: AppColors.textPrimary,
+        RichText(
+          text: TextSpan(
+            style: TextStyle(
+              fontSize: markSize * 0.42,
+              fontWeight: FontWeight.w800,
+              letterSpacing: markSize * 0.05,
+            ),
+            children: [
+              const TextSpan(
+                text: 'AVEC ',
+                style: TextStyle(color: AppColors.textPrimary),
+              ),
+              TextSpan(
+                text: 'OPERATIONS',
+                style: TextStyle(
+                  color: AppColors.textMuted,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ],
           ),
         ),
       ],
