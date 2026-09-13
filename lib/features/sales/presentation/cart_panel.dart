@@ -10,6 +10,7 @@ class CartPanel extends StatelessWidget {
     super.key,
     required this.ticket,
     required this.catalog,
+    required this.readOnly,
     required this.onQtyChanged,
     required this.onCustomerChanged,
     required this.onComplete,
@@ -19,6 +20,10 @@ class CartPanel extends StatelessWidget {
 
   final Ticket? ticket;
   final SalesCatalog catalog;
+
+  /// True when this table's ticket belongs to another operator — the
+  /// whole cart becomes look-but-don't-touch.
+  final bool readOnly;
   final void Function(TicketLine line, num newQty) onQtyChanged;
   final void Function(String customerCode) onCustomerChanged;
   final VoidCallback onComplete;
@@ -41,6 +46,28 @@ class CartPanel extends StatelessWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
+        if (readOnly)
+          Container(
+            width: double.infinity,
+            color: AppColors.error.withValues(alpha: 0.15),
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            child: Row(
+              children: [
+                const Icon(Icons.lock_outline, size: 16, color: AppColors.error),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'Locked — being served by ${t.operatorName.isEmpty ? 'another operator' : t.operatorName}',
+                    style: const TextStyle(
+                      color: AppColors.error,
+                      fontWeight: FontWeight.w600,
+                      fontSize: 12.5,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
         Padding(
           padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
           child: Column(
@@ -57,9 +84,11 @@ class CartPanel extends StatelessWidget {
                 items: catalog.customers
                     .map((c) => DropdownMenuItem(value: c.code, child: Text(c.description)))
                     .toList(),
-                onChanged: (v) {
-                  if (v != null) onCustomerChanged(v);
-                },
+                onChanged: readOnly
+                    ? null
+                    : (v) {
+                        if (v != null) onCustomerChanged(v);
+                      },
               ),
               const SizedBox(height: 10),
               Row(
@@ -81,7 +110,10 @@ class CartPanel extends StatelessWidget {
               ? const Center(
                   child: Text('No items yet', style: TextStyle(color: AppColors.textMuted)),
                 )
-              : _CartLines(ticket: t, onQtyChanged: onQtyChanged),
+              : _CartLines(
+                  ticket: t,
+                  onQtyChanged: readOnly ? null : onQtyChanged,
+                ),
         ),
         const Divider(height: 1, color: AppColors.border),
         Padding(
@@ -104,19 +136,19 @@ class CartPanel extends StatelessWidget {
               // a free-form ticket has no "sent" concept to distinguish.
               if (t.tableId != null) ...[
                 OutlinedButton.icon(
-                  onPressed: t.hasPendingLines ? onSendRound : null,
+                  onPressed: (!readOnly && t.hasPendingLines) ? onSendRound : null,
                   icon: const Icon(Icons.outbound, size: 18),
                   label: Text(t.currentRound == 0 ? 'Send order' : 'Send new round'),
                 ),
                 const SizedBox(height: 10),
               ],
               FilledButton(
-                onPressed: t.lines.isEmpty ? null : onComplete,
+                onPressed: (!readOnly && t.lines.isNotEmpty) ? onComplete : null,
                 child: const Text('Complete Sale'),
               ),
               const SizedBox(height: 6),
               TextButton(
-                onPressed: onCancel,
+                onPressed: readOnly ? null : onCancel,
                 style: TextButton.styleFrom(foregroundColor: AppColors.error),
                 child: const Text('Cancel ticket'),
               ),
@@ -131,7 +163,10 @@ class CartPanel extends StatelessWidget {
 class _CartLines extends StatelessWidget {
   const _CartLines({required this.ticket, required this.onQtyChanged});
   final Ticket ticket;
-  final void Function(TicketLine line, num newQty) onQtyChanged;
+
+  /// null (read-only cart) forces every line to render non-editable,
+  /// regardless of pending/sent status.
+  final void Function(TicketLine line, num newQty)? onQtyChanged;
 
   @override
   Widget build(BuildContext context) {
@@ -183,7 +218,10 @@ class _CartLines extends StatelessWidget {
         for (final line in pendingLines)
           Padding(
             padding: const EdgeInsets.only(bottom: 10),
-            child: _CartLineRow(line: line, onQtyChanged: (q) => onQtyChanged(line, q)),
+            child: _CartLineRow(
+              line: line,
+              onQtyChanged: onQtyChanged == null ? null : (q) => onQtyChanged!(line, q),
+            ),
           ),
       ],
     );

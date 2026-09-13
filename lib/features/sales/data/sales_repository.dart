@@ -93,6 +93,17 @@ class SalesRepository {
           .doc(businessUnitId)
           .collection('tickets');
 
+  CollectionReference<Map<String, dynamic>> _tableClaimsRef(
+    String companyId,
+    String businessUnitId,
+  ) =>
+      _firestore
+          .collection('companies')
+          .doc(companyId)
+          .collection('businessUnits')
+          .doc(businessUnitId)
+          .collection('tableClaims');
+
   Stream<List<Ticket>> watchOpenTickets({
     required String companyId,
     required String businessUnitId,
@@ -131,6 +142,70 @@ class SalesRepository {
       'updatedAt': FieldValue.serverTimestamp(),
     });
     return ref.id;
+  }
+
+  /// Atomically claims a table for [operatorUid] — or, if someone already
+  /// has it, hands back their existing ticket instead of creating a
+  /// competing one. This is what actually prevents the double-booking race
+  /// where two operators tap the same "free" table at the same moment:
+  /// whichever transaction's claim doc write commits first wins on the
+  /// server, and the loser is told who already has it rather than silently
+  /// creating a second ticket for the same physical table.
+  Future<({String ticketId, bool claimedByMe, String ownerUid, String ownerName})>
+      claimOrJoinTable({
+    required String companyId,
+    required String businessUnitId,
+    required String tableId,
+    required String zoneId,
+    required String tableName,
+    required String customerCode,
+    required String locationCode,
+    required String operatorUid,
+    required String operatorName,
+  }) {
+    final claimRef = _tableClaimsRef(companyId, businessUnitId).doc(tableId);
+    final ticketRef = _ticketsRef(companyId, businessUnitId).doc();
+
+    return _firestore.runTransaction((tx) async {
+      final claimSnap = await tx.get(claimRef);
+      final claim = claimSnap.data();
+      if (claim != null && claim['status'] == 'occupied') {
+        return (
+          ticketId: claim['ticketId'] as String? ?? '',
+          claimedByMe: false,
+          ownerUid: claim['operatorUid'] as String? ?? '',
+          ownerName: claim['operatorName'] as String? ?? '',
+        );
+      }
+
+      tx.set(ticketRef, {
+        'status': 'open',
+        'label': tableName,
+        'customerCode': customerCode,
+        'locationCode': locationCode,
+        'lines': <Map<String, dynamic>>[],
+        'operatorUid': operatorUid,
+        'operatorName': operatorName,
+        'tableId': tableId,
+        'zoneId': zoneId,
+        'currentRound': 0,
+        'createdAt': FieldValue.serverTimestamp(),
+        'updatedAt': FieldValue.serverTimestamp(),
+      });
+      tx.set(claimRef, {
+        'status': 'occupied',
+        'ticketId': ticketRef.id,
+        'operatorUid': operatorUid,
+        'operatorName': operatorName,
+        'updatedAt': FieldValue.serverTimestamp(),
+      });
+      return (
+        ticketId: ticketRef.id,
+        claimedByMe: true,
+        ownerUid: operatorUid,
+        ownerName: operatorName,
+      );
+    });
   }
 
   /// Full-array rewrite — only safe for mutations that aren't racing rapid
@@ -244,15 +319,31 @@ class SalesRepository {
     });
   }
 
+  /// [tableId] is passed (rather than re-read from the ticket) so this
+  /// stays a plain caller-supplied write; when present, the table's claim
+  /// is released in the same transaction so a stalled release can never
+  /// leave a completed table stuck looking occupied.
   Future<void> completeTicket({
     required String companyId,
     required String businessUnitId,
     required String ticketId,
+    String? tableId,
   }) {
-    return _ticketsRef(companyId, businessUnitId).doc(ticketId).update({
-      'status': 'completed',
-      'completedAt': FieldValue.serverTimestamp(),
-      'updatedAt': FieldValue.serverTimestamp(),
+    return _firestore.runTransaction((tx) async {
+      tx.update(_ticketsRef(companyId, businessUnitId).doc(ticketId), {
+        'status': 'completed',
+        'completedAt': FieldValue.serverTimestamp(),
+        'updatedAt': FieldValue.serverTimestamp(),
+      });
+      if (tableId != null) {
+        tx.set(_tableClaimsRef(companyId, businessUnitId).doc(tableId), {
+          'status': 'free',
+          'ticketId': null,
+          'operatorUid': null,
+          'operatorName': null,
+          'updatedAt': FieldValue.serverTimestamp(),
+        });
+      }
     });
   }
 
@@ -260,10 +351,22 @@ class SalesRepository {
     required String companyId,
     required String businessUnitId,
     required String ticketId,
+    String? tableId,
   }) {
-    return _ticketsRef(companyId, businessUnitId).doc(ticketId).update({
-      'status': 'cancelled',
-      'updatedAt': FieldValue.serverTimestamp(),
+    return _firestore.runTransaction((tx) async {
+      tx.update(_ticketsRef(companyId, businessUnitId).doc(ticketId), {
+        'status': 'cancelled',
+        'updatedAt': FieldValue.serverTimestamp(),
+      });
+      if (tableId != null) {
+        tx.set(_tableClaimsRef(companyId, businessUnitId).doc(tableId), {
+          'status': 'free',
+          'ticketId': null,
+          'operatorUid': null,
+          'operatorName': null,
+          'updatedAt': FieldValue.serverTimestamp(),
+        });
+      }
     });
   }
 }

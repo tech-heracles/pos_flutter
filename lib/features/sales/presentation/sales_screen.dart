@@ -75,12 +75,42 @@ class _SalesScreenState extends ConsumerState<SalesScreen> {
     List<Ticket> tickets,
     SalesCatalog catalog,
   ) async {
+    // Already visible locally (from the same stream the picker renders
+    // from) — no need to touch the claim doc, this also covers tickets
+    // created before table claiming existed and never got one.
     final existing = tickets.where((t) => t.tableId == table.id);
     if (existing.isNotEmpty) {
       setState(() => _selectedTicketId = existing.first.id);
       return;
     }
-    await _createTicket(tickets, catalog, tableId: table.id, zoneId: zone.id, label: table.name);
+
+    final paired = ref.read(pairedDeviceProvider).value;
+    final user = ref.read(authStateChangesProvider).value;
+    if (paired == null || user == null) return;
+
+    // Looks free locally, but another operator's tap could be racing this
+    // one right now — the actual claim goes through an atomic transaction
+    // rather than trusting this snapshot, so only one of them wins.
+    final result = await ref.read(salesRepositoryProvider).claimOrJoinTable(
+          companyId: paired.companyId,
+          businessUnitId: paired.businessUnitId,
+          tableId: table.id,
+          zoneId: zone.id,
+          tableName: table.name,
+          customerCode: catalog.defaultCustomerCode ?? '',
+          locationCode: catalog.defaultLocationCode ?? '',
+          operatorUid: user.uid,
+          operatorName: user.displayName ?? '',
+        );
+    if (!mounted) return;
+    setState(() => _selectedTicketId = result.ticketId);
+    if (!result.claimedByMe) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('${table.name} is already being served by ${result.ownerName}'),
+        ),
+      );
+    }
   }
 
   Future<void> _addItem(PosItem item, Ticket ticket, SalesCatalog catalog) async {
@@ -190,6 +220,7 @@ class _SalesScreenState extends ConsumerState<SalesScreen> {
           companyId: paired.companyId,
           businessUnitId: paired.businessUnitId,
           ticketId: ticket.id,
+          tableId: ticket.tableId,
         );
     if (mounted) setState(() => _selectedTicketId = null);
   }
@@ -221,6 +252,7 @@ class _SalesScreenState extends ConsumerState<SalesScreen> {
           companyId: paired.companyId,
           businessUnitId: paired.businessUnitId,
           ticketId: ticket.id,
+          tableId: ticket.tableId,
         );
     if (mounted) setState(() => _selectedTicketId = null);
   }
@@ -244,9 +276,16 @@ class _SalesScreenState extends ConsumerState<SalesScreen> {
         .toList();
   }
 
+  /// A table-bound ticket is exclusive to the operator who claimed it —
+  /// everyone else can look (see totals/items) but not touch it.
+  bool _isLockedForMe(Ticket ticket, String? myUid) {
+    return ticket.tableId != null && ticket.operatorUid != myUid;
+  }
+
   @override
   Widget build(BuildContext context) {
     final paired = ref.watch(pairedDeviceProvider).value;
+    final myUid = ref.watch(authStateChangesProvider).value?.uid;
     final catalogAsync = ref.watch(salesCatalogProvider);
     final ticketsAsync = ref.watch(openTicketsProvider);
 
@@ -322,10 +361,12 @@ class _SalesScreenState extends ConsumerState<SalesScreen> {
                   Expanded(
                     child: LayoutBuilder(
                       builder: (context, constraints) {
-                        final browser = _buildBrowser(catalog, selected);
+                        final readOnly = selected != null && _isLockedForMe(selected, myUid);
+                        final browser = _buildBrowser(catalog, selected, readOnly);
                         final cart = CartPanel(
                           ticket: selected,
                           catalog: catalog,
+                          readOnly: readOnly,
                           onQtyChanged: (line, qty) => _changeQty(selected!, line, qty),
                           onCustomerChanged: (code) => _changeCustomer(selected!, code, catalog),
                           onComplete: () => _completeTicket(selected!),
@@ -399,7 +440,7 @@ class _SalesScreenState extends ConsumerState<SalesScreen> {
     );
   }
 
-  Widget _buildBrowser(SalesCatalog catalog, Ticket? selected) {
+  Widget _buildBrowser(SalesCatalog catalog, Ticket? selected, bool readOnly) {
     final items = _visibleItems(catalog);
     final categoriesForGroup = catalog.categories
         .where((c) => c.groupCodes.contains(_selectedGroupCode))
@@ -494,7 +535,9 @@ class _SalesScreenState extends ConsumerState<SalesScreen> {
                     return _ItemTile(
                       item: item,
                       price: price,
-                      onTap: selected == null ? null : () => _addItem(item, selected, catalog),
+                      onTap: (selected == null || readOnly)
+                          ? null
+                          : () => _addItem(item, selected, catalog),
                     );
                   },
                 ),
@@ -704,7 +747,10 @@ class _TableTile extends StatelessWidget {
               ),
               const SizedBox(height: 2),
               Text(
-                occupied ? ticket!.total.toStringAsFixed(0) : 'Free',
+                occupied
+                    ? '${ticket!.operatorName.isEmpty ? '?' : ticket!.operatorName} · ${ticket!.total.toStringAsFixed(0)}'
+                    : 'Free',
+                overflow: TextOverflow.ellipsis,
                 style: TextStyle(fontSize: 11, color: occupied ? fg : AppColors.textMuted),
               ),
             ],
