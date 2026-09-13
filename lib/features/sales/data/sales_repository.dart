@@ -7,6 +7,7 @@ import '../domain/pos_item.dart';
 import '../domain/pos_location.dart';
 import '../domain/ticket.dart';
 import '../domain/ticket_line.dart';
+import '../domain/zone.dart';
 
 /// Fetches Items/Categories/Groups/Customers in full (no pagination) since
 /// the sale screen needs everything in memory at once for instant
@@ -49,8 +50,14 @@ class SalesRepository {
     return snap.docs.map((d) => PosLocation.fromDoc(d.id, d.data())).toList();
   }
 
-  Future<({String? defaultCustomerCode, String? defaultLocationCode})>
-      fetchBusinessUnitDefaults({
+  Future<
+      ({
+        String? defaultCustomerCode,
+        String? defaultLocationCode,
+        List<String>? visibleItemGroupCodes,
+        String salesMode,
+        List<Zone> zones,
+      })> fetchBusinessUnitDefaults({
     required String companyId,
     required String businessUnitId,
   }) async {
@@ -64,6 +71,14 @@ class SalesRepository {
     return (
       defaultCustomerCode: data?['defaultCustomerCode'] as String?,
       defaultLocationCode: data?['defaultLocationCode'] as String?,
+      visibleItemGroupCodes: (data?['visibleItemGroupCodes'] as List<dynamic>?)
+          ?.map((e) => e.toString())
+          .toList(),
+      salesMode: data?['salesMode'] as String? ?? 'simple',
+      zones: (data?['zones'] as List<dynamic>? ?? [])
+          .whereType<Map<String, dynamic>>()
+          .map(Zone.fromMap)
+          .toList(),
     );
   }
 
@@ -97,6 +112,8 @@ class SalesRepository {
     required String locationCode,
     required String operatorUid,
     required String operatorName,
+    String? tableId,
+    String? zoneId,
   }) async {
     final ref = _ticketsRef(companyId, businessUnitId).doc();
     await ref.set({
@@ -107,6 +124,9 @@ class SalesRepository {
       'lines': <Map<String, dynamic>>[],
       'operatorUid': operatorUid,
       'operatorName': operatorName,
+      'tableId': tableId,
+      'zoneId': zoneId,
+      'currentRound': 0,
       'createdAt': FieldValue.serverTimestamp(),
       'updatedAt': FieldValue.serverTimestamp(),
     });
@@ -127,69 +147,88 @@ class SalesRepository {
     });
   }
 
-  List<TicketLine> _linesFrom(DocumentSnapshot<Map<String, dynamic>> snap) {
-    return (snap.data()?['lines'] as List<dynamic>? ?? [])
-        .whereType<Map<String, dynamic>>()
-        .map(TicketLine.fromMap)
-        .toList();
-  }
-
-  /// Runs as a transaction (reads the current lines fresh from the server
-  /// inside it) so rapid taps never clobber each other the way a plain
-  /// read-modify-write from possibly-stale client state would.
+  /// Plain optimistic update computed from [currentLines] — the caller's
+  /// already-fresh local ticket state (from the same `watchOpenTickets`
+  /// stream this screen renders from, which itself reflects Firestore's
+  /// latency-compensated pending writes). A transaction re-reading from the
+  /// server here would trade that instant local echo for a network round
+  /// trip on every tap, which is what actually caused visible lag — the
+  /// same-device tap sequence this guards is not truly concurrent, so the
+  /// extra round trip bought correctness the flow didn't need.
+  ///
+  /// Only merges into a *pending* (not yet sent) line with the same item
+  /// code — an already-sent line from an earlier round is left alone so a
+  /// re-order starts a fresh pending line instead of reopening history.
   Future<void> addOrIncrementItem({
     required String companyId,
     required String businessUnitId,
     required String ticketId,
+    required List<TicketLine> currentLines,
     required String itemCode,
     required String description,
     required num unitPrice,
   }) {
-    final ref = _ticketsRef(companyId, businessUnitId).doc(ticketId);
-    return _firestore.runTransaction((tx) async {
-      final snap = await tx.get(ref);
-      final lines = _linesFrom(snap);
-      final index = lines.indexWhere((l) => l.itemCode == itemCode);
-      if (index >= 0) {
-        lines[index] = lines[index].copyWith(qty: lines[index].qty + 1);
-      } else {
-        lines.add(TicketLine(
-          itemCode: itemCode,
-          description: description,
-          unitPrice: unitPrice,
-          qty: 1,
-        ));
-      }
-      tx.update(ref, {
-        'lines': lines.map((l) => l.toMap()).toList(),
-        'updatedAt': FieldValue.serverTimestamp(),
-      });
+    final lines = List<TicketLine>.from(currentLines);
+    final index = lines.indexWhere((l) => l.itemCode == itemCode && l.isPending);
+    if (index >= 0) {
+      lines[index] = lines[index].copyWith(qty: lines[index].qty + 1);
+    } else {
+      lines.add(TicketLine(
+        itemCode: itemCode,
+        description: description,
+        unitPrice: unitPrice,
+        qty: 1,
+      ));
+    }
+    return _ticketsRef(companyId, businessUnitId).doc(ticketId).update({
+      'lines': lines.map((l) => l.toMap()).toList(),
+      'updatedAt': FieldValue.serverTimestamp(),
     });
   }
 
-  /// Same transactional safety as [addOrIncrementItem]; qty <= 0 removes
-  /// the line.
+  /// Same optimistic-from-local-state approach as [addOrIncrementItem].
+  /// qty <= 0 removes the line. Only ever targets pending lines — quantity
+  /// on an already-sent round isn't editable from the cart.
   Future<void> setItemQty({
     required String companyId,
     required String businessUnitId,
     required String ticketId,
+    required List<TicketLine> currentLines,
     required String itemCode,
     required num newQty,
   }) {
-    final ref = _ticketsRef(companyId, businessUnitId).doc(ticketId);
-    return _firestore.runTransaction((tx) async {
-      final snap = await tx.get(ref);
-      final lines = _linesFrom(snap);
-      if (newQty <= 0) {
-        lines.removeWhere((l) => l.itemCode == itemCode);
-      } else {
-        final index = lines.indexWhere((l) => l.itemCode == itemCode);
-        if (index >= 0) lines[index] = lines[index].copyWith(qty: newQty);
-      }
-      tx.update(ref, {
-        'lines': lines.map((l) => l.toMap()).toList(),
-        'updatedAt': FieldValue.serverTimestamp(),
-      });
+    final lines = List<TicketLine>.from(currentLines);
+    if (newQty <= 0) {
+      lines.removeWhere((l) => l.itemCode == itemCode && l.isPending);
+    } else {
+      final index = lines.indexWhere((l) => l.itemCode == itemCode && l.isPending);
+      if (index >= 0) lines[index] = lines[index].copyWith(qty: newQty);
+    }
+    return _ticketsRef(companyId, businessUnitId).doc(ticketId).update({
+      'lines': lines.map((l) => l.toMap()).toList(),
+      'updatedAt': FieldValue.serverTimestamp(),
+    });
+  }
+
+  /// BAR/RESTAURANT mode: stamps every pending line with the next round
+  /// number so it's locked into that round's history, then bumps
+  /// [Ticket.currentRound]. The table keeps accumulating rounds until
+  /// completeTicket closes it with one summary invoice over every line.
+  Future<void> sendRound({
+    required String companyId,
+    required String businessUnitId,
+    required String ticketId,
+    required List<TicketLine> currentLines,
+    required int currentRound,
+  }) {
+    final nextRound = currentRound + 1;
+    final lines = currentLines
+        .map((l) => l.isPending ? l.copyWith(roundNumber: nextRound) : l)
+        .toList();
+    return _ticketsRef(companyId, businessUnitId).doc(ticketId).update({
+      'lines': lines.map((l) => l.toMap()).toList(),
+      'currentRound': nextRound,
+      'updatedAt': FieldValue.serverTimestamp(),
     });
   }
 

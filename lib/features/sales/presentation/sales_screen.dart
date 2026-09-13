@@ -9,6 +9,7 @@ import '../application/sales_providers.dart';
 import '../domain/pos_item.dart';
 import '../domain/ticket.dart';
 import '../domain/ticket_line.dart';
+import '../domain/zone.dart';
 import 'cart_panel.dart';
 
 class SalesScreen extends ConsumerStatefulWidget {
@@ -22,6 +23,7 @@ class _SalesScreenState extends ConsumerState<SalesScreen> {
   String? _selectedTicketId;
   String? _selectedGroupCode;
   String? _selectedCategoryCode;
+  String? _selectedZoneId;
   final _searchController = TextEditingController();
   String _search = '';
   bool _creatingTicket = false;
@@ -33,13 +35,22 @@ class _SalesScreenState extends ConsumerState<SalesScreen> {
   }
 
   Future<void> _ensureTicketExists(List<Ticket> tickets, SalesCatalog catalog) async {
+    // Tables mode: tables ARE the tickets — nothing to auto-create until
+    // the operator taps one.
+    if (catalog.isTablesMode) return;
     if (tickets.isNotEmpty || _creatingTicket) return;
     _creatingTicket = true;
     await _createTicket(tickets, catalog);
     _creatingTicket = false;
   }
 
-  Future<void> _createTicket(List<Ticket> tickets, SalesCatalog catalog) async {
+  Future<void> _createTicket(
+    List<Ticket> tickets,
+    SalesCatalog catalog, {
+    String? tableId,
+    String? zoneId,
+    String? label,
+  }) async {
     final paired = ref.read(pairedDeviceProvider).value;
     final user = ref.read(authStateChangesProvider).value;
     if (paired == null) return;
@@ -47,29 +58,59 @@ class _SalesScreenState extends ConsumerState<SalesScreen> {
     final id = await ref.read(salesRepositoryProvider).createTicket(
           companyId: paired.companyId,
           businessUnitId: paired.businessUnitId,
-          label: 'Ticket ${tickets.length + 1}',
+          label: label ?? 'Ticket ${tickets.length + 1}',
           customerCode: catalog.defaultCustomerCode ?? '',
           locationCode: catalog.defaultLocationCode ?? '',
           operatorUid: user?.uid ?? '',
           operatorName: user?.displayName ?? '',
+          tableId: tableId,
+          zoneId: zoneId,
         );
     if (mounted) setState(() => _selectedTicketId = id);
+  }
+
+  Future<void> _onTableTap(
+    Zone zone,
+    ZoneTable table,
+    List<Ticket> tickets,
+    SalesCatalog catalog,
+  ) async {
+    final existing = tickets.where((t) => t.tableId == table.id);
+    if (existing.isNotEmpty) {
+      setState(() => _selectedTicketId = existing.first.id);
+      return;
+    }
+    await _createTicket(tickets, catalog, tableId: table.id, zoneId: zone.id, label: table.name);
   }
 
   Future<void> _addItem(PosItem item, Ticket ticket, SalesCatalog catalog) async {
     final paired = ref.read(pairedDeviceProvider).value;
     if (paired == null) return;
 
-    // Transactional: re-reads lines fresh from the server rather than from
-    // the (possibly stale) `ticket` passed in, so rapid taps can't clobber
-    // each other's writes.
+    // Optimistic write off the ticket state this screen already has (from
+    // the same stream it renders from) — see SalesRepository for why this
+    // is both correct and instant, unlike the transactional round trip it
+    // replaced.
     await ref.read(salesRepositoryProvider).addOrIncrementItem(
           companyId: paired.companyId,
           businessUnitId: paired.businessUnitId,
           ticketId: ticket.id,
+          currentLines: ticket.lines,
           itemCode: item.code,
           description: item.description,
           unitPrice: _priceFor(item, ticket, catalog),
+        );
+  }
+
+  Future<void> _sendRound(Ticket ticket) async {
+    final paired = ref.read(pairedDeviceProvider).value;
+    if (paired == null) return;
+    await ref.read(salesRepositoryProvider).sendRound(
+          companyId: paired.companyId,
+          businessUnitId: paired.businessUnitId,
+          ticketId: ticket.id,
+          currentLines: ticket.lines,
+          currentRound: ticket.currentRound,
         );
   }
 
@@ -94,6 +135,7 @@ class _SalesScreenState extends ConsumerState<SalesScreen> {
           companyId: paired.companyId,
           businessUnitId: paired.businessUnitId,
           ticketId: ticket.id,
+          currentLines: ticket.lines,
           itemCode: line.itemCode,
           newQty: newQty,
         );
@@ -184,7 +226,10 @@ class _SalesScreenState extends ConsumerState<SalesScreen> {
   }
 
   List<PosItem> _visibleItems(SalesCatalog catalog) {
-    final active = catalog.items.where((i) => i.active);
+    final allowedGroups = catalog.visibleItemGroupCodes;
+    final active = catalog.items.where(
+      (i) => i.active && (allowedGroups == null || allowedGroups.contains(i.groupCode)),
+    );
     if (_search.trim().isNotEmpty) {
       final q = _search.trim().toLowerCase();
       return active
@@ -223,8 +268,12 @@ class _SalesScreenState extends ConsumerState<SalesScreen> {
               style: const TextStyle(color: AppColors.textSecondary)),
         ),
         data: (catalog) {
-          if (_selectedGroupCode == null && catalog.groups.isNotEmpty) {
-            _selectedGroupCode = catalog.groups.first.code;
+          final visibleGroups = catalog.visibleGroups;
+          if (_selectedGroupCode == null && visibleGroups.isNotEmpty) {
+            _selectedGroupCode = visibleGroups.first.code;
+          }
+          if (catalog.isTablesMode && _selectedZoneId == null && catalog.zones.isNotEmpty) {
+            _selectedZoneId = catalog.zones.first.id;
           }
 
           return ticketsAsync.when(
@@ -239,19 +288,36 @@ class _SalesScreenState extends ConsumerState<SalesScreen> {
               });
 
               Ticket? selected;
-              if (tickets.isNotEmpty) {
+              if (catalog.isTablesMode) {
+                // Don't fall back to an arbitrary open table — stay
+                // unselected until the operator actually taps one.
+                if (_selectedTicketId != null) {
+                  final matches = tickets.where((t) => t.id == _selectedTicketId);
+                  selected = matches.isNotEmpty ? matches.first : null;
+                }
+              } else if (tickets.isNotEmpty) {
                 final matches = tickets.where((t) => t.id == _selectedTicketId);
                 selected = matches.isNotEmpty ? matches.first : tickets.first;
               }
 
               return Column(
                 children: [
-                  _TicketTabsBar(
-                    tickets: tickets,
-                    selectedId: selected?.id,
-                    onSelect: (id) => setState(() => _selectedTicketId = id),
-                    onAdd: () => _createTicket(tickets, catalog),
-                  ),
+                  if (catalog.isTablesMode)
+                    _ZoneTableBar(
+                      zones: catalog.zones,
+                      tickets: tickets,
+                      selectedZoneId: _selectedZoneId,
+                      selectedTicketId: selected?.id,
+                      onZoneSelect: (id) => setState(() => _selectedZoneId = id),
+                      onTableTap: (zone, table) => _onTableTap(zone, table, tickets, catalog),
+                    )
+                  else
+                    _TicketTabsBar(
+                      tickets: tickets,
+                      selectedId: selected?.id,
+                      onSelect: (id) => setState(() => _selectedTicketId = id),
+                      onAdd: () => _createTicket(tickets, catalog),
+                    ),
                   const Divider(height: 1, color: AppColors.border),
                   Expanded(
                     child: LayoutBuilder(
@@ -264,6 +330,7 @@ class _SalesScreenState extends ConsumerState<SalesScreen> {
                           onCustomerChanged: (code) => _changeCustomer(selected!, code, catalog),
                           onComplete: () => _completeTicket(selected!),
                           onCancel: () => _cancelTicket(selected!),
+                          onSendRound: () => _sendRound(selected!),
                         );
 
                         if (constraints.maxWidth > 760) {
@@ -281,34 +348,43 @@ class _SalesScreenState extends ConsumerState<SalesScreen> {
                           children: [
                             Expanded(child: browser),
                             const Divider(height: 1, color: AppColors.border),
-                            InkWell(
-                              onTap: () => showModalBottomSheet(
-                                context: context,
-                                isScrollControlled: true,
-                                backgroundColor: AppColors.surface,
-                                builder: (_) => SizedBox(
-                                  height: MediaQuery.of(context).size.height * 0.85,
-                                  child: cart,
+                            if (selected == null)
+                              const Padding(
+                                padding: EdgeInsets.all(16),
+                                child: Text(
+                                  'Select a table to start an order',
+                                  style: TextStyle(color: AppColors.textSecondary),
+                                ),
+                              )
+                            else
+                              InkWell(
+                                onTap: () => showModalBottomSheet(
+                                  context: context,
+                                  isScrollControlled: true,
+                                  backgroundColor: AppColors.surface,
+                                  builder: (_) => SizedBox(
+                                    height: MediaQuery.of(context).size.height * 0.85,
+                                    child: cart,
+                                  ),
+                                ),
+                                child: Padding(
+                                  padding: const EdgeInsets.all(16),
+                                  child: Row(
+                                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                    children: [
+                                      Text(
+                                        '${selected.lines.length} items · ${selected.label}',
+                                        style: const TextStyle(fontWeight: FontWeight.w600),
+                                      ),
+                                      Text(
+                                        selected.total.toStringAsFixed(2),
+                                        style: const TextStyle(
+                                            fontWeight: FontWeight.w700, color: AppColors.orange),
+                                      ),
+                                    ],
+                                  ),
                                 ),
                               ),
-                              child: Padding(
-                                padding: const EdgeInsets.all(16),
-                                child: Row(
-                                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                                  children: [
-                                    Text(
-                                      '${selected?.lines.length ?? 0} items · ${selected?.label ?? ''}',
-                                      style: const TextStyle(fontWeight: FontWeight.w600),
-                                    ),
-                                    Text(
-                                      (selected?.total ?? 0).toStringAsFixed(2),
-                                      style: const TextStyle(
-                                          fontWeight: FontWeight.w700, color: AppColors.orange),
-                                    ),
-                                  ],
-                                ),
-                              ),
-                            ),
                           ],
                         );
                       },
@@ -346,18 +422,18 @@ class _SalesScreenState extends ConsumerState<SalesScreen> {
         ),
         if (_search.trim().isEmpty) ...[
           SizedBox(
-            height: 44,
+            height: 32,
             child: ListView(
               scrollDirection: Axis.horizontal,
               padding: const EdgeInsets.symmetric(horizontal: 12),
               children: [
-                for (final group in catalog.groups)
+                for (final group in catalog.visibleGroups)
                   Padding(
-                    padding: const EdgeInsets.only(right: 8),
-                    child: ChoiceChip(
-                      label: Text(group.description),
+                    padding: const EdgeInsets.only(right: 6),
+                    child: _CompactChip(
+                      label: group.description,
                       selected: _selectedGroupCode == group.code,
-                      onSelected: (_) => setState(() {
+                      onSelected: () => setState(() {
                         _selectedGroupCode = group.code;
                         _selectedCategoryCode = null;
                       }),
@@ -366,34 +442,36 @@ class _SalesScreenState extends ConsumerState<SalesScreen> {
               ],
             ),
           ),
-          if (categoriesForGroup.isNotEmpty)
+          if (categoriesForGroup.isNotEmpty) ...[
+            const SizedBox(height: 4),
             SizedBox(
-              height: 40,
+              height: 28,
               child: ListView(
                 scrollDirection: Axis.horizontal,
-                padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+                padding: const EdgeInsets.fromLTRB(12, 0, 12, 6),
                 children: [
                   Padding(
-                    padding: const EdgeInsets.only(right: 8),
-                    child: ChoiceChip(
-                      label: const Text('All'),
+                    padding: const EdgeInsets.only(right: 6),
+                    child: _CompactChip(
+                      label: 'All',
                       selected: _selectedCategoryCode == null,
-                      onSelected: (_) => setState(() => _selectedCategoryCode = null),
+                      onSelected: () => setState(() => _selectedCategoryCode = null),
                     ),
                   ),
                   for (final category in categoriesForGroup)
                     Padding(
-                      padding: const EdgeInsets.only(right: 8),
-                      child: ChoiceChip(
-                        label: Text(category.description),
+                      padding: const EdgeInsets.only(right: 6),
+                      child: _CompactChip(
+                        label: category.description,
                         selected: _selectedCategoryCode == category.code,
-                        onSelected: (_) =>
+                        onSelected: () =>
                             setState(() => _selectedCategoryCode = category.code),
                       ),
                     ),
                 ],
               ),
             ),
+          ],
         ],
         Expanded(
           child: items.isEmpty
@@ -457,11 +535,181 @@ class _TicketTabsBar extends StatelessWidget {
               ),
             ),
           ActionChip(
-            avatar: const Icon(Icons.add, size: 16),
-            label: const Text('New'),
+            backgroundColor: AppColors.orange,
+            avatar: const Icon(Icons.add, size: 18, color: Colors.white),
+            label: const Text(
+              'New',
+              style: TextStyle(color: Colors.white, fontWeight: FontWeight.w700),
+            ),
             onPressed: onAdd,
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// Small-footprint ChoiceChip used for the group/category rows — the
+/// default ChoiceChip padding/density ate too much vertical space when
+/// there are many groups.
+class _CompactChip extends StatelessWidget {
+  const _CompactChip({required this.label, required this.selected, required this.onSelected});
+  final String label;
+  final bool selected;
+  final VoidCallback onSelected;
+
+  @override
+  Widget build(BuildContext context) {
+    return ChoiceChip(
+      label: Text(label, style: const TextStyle(fontSize: 12)),
+      selected: selected,
+      onSelected: (_) => onSelected(),
+      visualDensity: VisualDensity.compact,
+      materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+      labelPadding: const EdgeInsets.symmetric(horizontal: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 0),
+    );
+  }
+}
+
+class _ZoneTableBar extends StatelessWidget {
+  const _ZoneTableBar({
+    required this.zones,
+    required this.tickets,
+    required this.selectedZoneId,
+    required this.selectedTicketId,
+    required this.onZoneSelect,
+    required this.onTableTap,
+  });
+
+  final List<Zone> zones;
+  final List<Ticket> tickets;
+  final String? selectedZoneId;
+  final String? selectedTicketId;
+  final ValueChanged<String> onZoneSelect;
+  final void Function(Zone zone, ZoneTable table) onTableTap;
+
+  @override
+  Widget build(BuildContext context) {
+    if (zones.isEmpty) {
+      return const Padding(
+        padding: EdgeInsets.all(16),
+        child: Text(
+          'No zones/tables configured for this business unit yet — add them in Manager.',
+          style: TextStyle(color: AppColors.textSecondary),
+        ),
+      );
+    }
+    final zone = zones.firstWhere((z) => z.id == selectedZoneId, orElse: () => zones.first);
+    final ticketByTable = {
+      for (final t in tickets)
+        if (t.tableId != null) t.tableId!: t,
+    };
+
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        SizedBox(
+          height: 32,
+          child: ListView(
+            scrollDirection: Axis.horizontal,
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+            children: [
+              for (final z in zones)
+                Padding(
+                  padding: const EdgeInsets.only(right: 6),
+                  child: _CompactChip(
+                    label: z.name,
+                    selected: z.id == zone.id,
+                    onSelected: () => onZoneSelect(z.id),
+                  ),
+                ),
+            ],
+          ),
+        ),
+        SizedBox(
+          height: 64,
+          child: zone.tables.isEmpty
+              ? const Center(
+                  child: Text(
+                    'No tables in this zone',
+                    style: TextStyle(color: AppColors.textMuted, fontSize: 12),
+                  ),
+                )
+              : ListView(
+                  scrollDirection: Axis.horizontal,
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                  children: [
+                    for (final table in zone.tables)
+                      Padding(
+                        padding: const EdgeInsets.only(right: 8),
+                        child: _TableTile(
+                          table: table,
+                          ticket: ticketByTable[table.id],
+                          selected: ticketByTable[table.id]?.id == selectedTicketId,
+                          onTap: () => onTableTap(zone, table),
+                        ),
+                      ),
+                  ],
+                ),
+        ),
+      ],
+    );
+  }
+}
+
+class _TableTile extends StatelessWidget {
+  const _TableTile({
+    required this.table,
+    required this.ticket,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final ZoneTable table;
+  final Ticket? ticket;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final occupied = ticket != null;
+    final bg = selected
+        ? AppColors.orange
+        : occupied
+            ? AppColors.orange.withValues(alpha: 0.15)
+            : AppColors.surface;
+    final fg = selected ? Colors.white : AppColors.textPrimary;
+
+    return Material(
+      color: bg,
+      borderRadius: BorderRadius.circular(10),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(10),
+        onTap: onTap,
+        child: Container(
+          width: 92,
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(color: selected ? AppColors.orange : AppColors.border),
+          ),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Text(
+                table.name,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(fontWeight: FontWeight.w700, fontSize: 13, color: fg),
+              ),
+              const SizedBox(height: 2),
+              Text(
+                occupied ? ticket!.total.toStringAsFixed(0) : 'Free',
+                style: TextStyle(fontSize: 11, color: occupied ? fg : AppColors.textMuted),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }

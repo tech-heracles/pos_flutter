@@ -9,6 +9,7 @@ import '../domain/pos_customer.dart';
 import '../domain/pos_item.dart';
 import '../domain/pos_location.dart';
 import '../domain/ticket.dart';
+import '../domain/zone.dart';
 
 final salesRepositoryProvider = Provider<SalesRepository>(
   (ref) => SalesRepository(FirebaseFirestore.instance),
@@ -23,6 +24,9 @@ class SalesCatalog {
     required this.locations,
     required this.defaultCustomerCode,
     required this.defaultLocationCode,
+    required this.visibleItemGroupCodes,
+    required this.salesMode,
+    required this.zones,
   });
 
   final List<PosItem> items;
@@ -33,6 +37,20 @@ class SalesCatalog {
   final String? defaultCustomerCode;
   final String? defaultLocationCode;
 
+  /// null means every group is shown; otherwise only these group codes.
+  final List<String>? visibleItemGroupCodes;
+
+  /// 'simple' (free-form tickets) or 'tables' (BAR/RESTAURANT: zone + table
+  /// picker, with rounds queued on a ticket before one summary invoice).
+  final String salesMode;
+  final List<Zone> zones;
+
+  bool get isTablesMode => salesMode == 'tables';
+
+  List<ItemGroup> get visibleGroups => visibleItemGroupCodes == null
+      ? groups
+      : groups.where((g) => visibleItemGroupCodes!.contains(g.code)).toList();
+
   static const empty = SalesCatalog(
     items: [],
     groups: [],
@@ -41,6 +59,9 @@ class SalesCatalog {
     locations: [],
     defaultCustomerCode: null,
     defaultLocationCode: null,
+    visibleItemGroupCodes: null,
+    salesMode: 'simple',
+    zones: [],
   );
 }
 
@@ -69,6 +90,9 @@ final salesCatalogProvider = FutureProvider<SalesCatalog>((ref) async {
     locations: locations,
     defaultCustomerCode: defaults.defaultCustomerCode,
     defaultLocationCode: defaults.defaultLocationCode,
+    visibleItemGroupCodes: defaults.visibleItemGroupCodes,
+    salesMode: defaults.salesMode,
+    zones: defaults.zones,
   );
 });
 

@@ -14,6 +14,7 @@ class CartPanel extends StatelessWidget {
     required this.onCustomerChanged,
     required this.onComplete,
     required this.onCancel,
+    required this.onSendRound,
   });
 
   final Ticket? ticket;
@@ -22,6 +23,7 @@ class CartPanel extends StatelessWidget {
   final void Function(String customerCode) onCustomerChanged;
   final VoidCallback onComplete;
   final VoidCallback onCancel;
+  final VoidCallback onSendRound;
 
   @override
   Widget build(BuildContext context) {
@@ -79,18 +81,7 @@ class CartPanel extends StatelessWidget {
               ? const Center(
                   child: Text('No items yet', style: TextStyle(color: AppColors.textMuted)),
                 )
-              : ListView.separated(
-                  padding: const EdgeInsets.all(16),
-                  itemCount: t.lines.length,
-                  separatorBuilder: (_, _) => const SizedBox(height: 10),
-                  itemBuilder: (context, index) {
-                    final line = t.lines[index];
-                    return _CartLineRow(
-                      line: line,
-                      onQtyChanged: (q) => onQtyChanged(line, q),
-                    );
-                  },
-                ),
+              : _CartLines(ticket: t, onQtyChanged: onQtyChanged),
         ),
         const Divider(height: 1, color: AppColors.border),
         Padding(
@@ -109,6 +100,16 @@ class CartPanel extends StatelessWidget {
                 ],
               ),
               const SizedBox(height: 14),
+              // Only table-bound tickets (BAR/RESTAURANT mode) queue rounds —
+              // a free-form ticket has no "sent" concept to distinguish.
+              if (t.tableId != null) ...[
+                OutlinedButton.icon(
+                  onPressed: t.hasPendingLines ? onSendRound : null,
+                  icon: const Icon(Icons.outbound, size: 18),
+                  label: Text(t.currentRound == 0 ? 'Send order' : 'Send new round'),
+                ),
+                const SizedBox(height: 10),
+              ],
               FilledButton(
                 onPressed: t.lines.isEmpty ? null : onComplete,
                 child: const Text('Complete Sale'),
@@ -127,13 +128,79 @@ class CartPanel extends StatelessWidget {
   }
 }
 
-class _CartLineRow extends StatelessWidget {
-  const _CartLineRow({required this.line, required this.onQtyChanged});
-  final TicketLine line;
-  final ValueChanged<num> onQtyChanged;
+class _CartLines extends StatelessWidget {
+  const _CartLines({required this.ticket, required this.onQtyChanged});
+  final Ticket ticket;
+  final void Function(TicketLine line, num newQty) onQtyChanged;
 
   @override
   Widget build(BuildContext context) {
+    final isTableTicket = ticket.tableId != null;
+    final pendingLines = isTableTicket
+        ? ticket.lines.where((l) => l.isPending).toList()
+        : ticket.lines;
+    final sentByRound = <int, List<TicketLine>>{};
+    if (isTableTicket) {
+      for (final line in ticket.lines.where((l) => !l.isPending)) {
+        sentByRound.putIfAbsent(line.roundNumber, () => []).add(line);
+      }
+    }
+    final sortedRounds = sentByRound.keys.toList()..sort();
+
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        for (final round in sortedRounds) ...[
+          Padding(
+            padding: const EdgeInsets.only(bottom: 6),
+            child: Text(
+              'Round $round · sent',
+              style: const TextStyle(
+                fontSize: 11,
+                fontWeight: FontWeight.w700,
+                color: AppColors.textMuted,
+              ),
+            ),
+          ),
+          for (final line in sentByRound[round]!)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 10),
+              child: _CartLineRow(line: line, onQtyChanged: null),
+            ),
+        ],
+        if (isTableTicket && pendingLines.isNotEmpty)
+          Padding(
+            padding: EdgeInsets.only(bottom: 6, top: sortedRounds.isEmpty ? 0 : 4),
+            child: const Text(
+              'New — not sent yet',
+              style: TextStyle(
+                fontSize: 11,
+                fontWeight: FontWeight.w700,
+                color: AppColors.orange,
+              ),
+            ),
+          ),
+        for (final line in pendingLines)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 10),
+            child: _CartLineRow(line: line, onQtyChanged: (q) => onQtyChanged(line, q)),
+          ),
+      ],
+    );
+  }
+}
+
+class _CartLineRow extends StatelessWidget {
+  const _CartLineRow({required this.line, required this.onQtyChanged});
+  final TicketLine line;
+
+  /// null for an already-sent line — its quantity is locked into that
+  /// round's history, shown as plain text instead of a stepper.
+  final ValueChanged<num>? onQtyChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final editable = onQtyChanged != null;
     return Row(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -152,20 +219,30 @@ class _CartLineRow extends StatelessWidget {
             ],
           ),
         ),
-        Row(
-          children: [
-            _StepperButton(icon: Icons.remove, onTap: () => onQtyChanged(line.qty - 1)),
-            SizedBox(
-              width: 28,
-              child: Text(
-                '${line.qty}',
-                textAlign: TextAlign.center,
-                style: const TextStyle(fontWeight: FontWeight.w600),
+        if (editable)
+          Row(
+            children: [
+              _StepperButton(icon: Icons.remove, onTap: () => onQtyChanged!(line.qty - 1)),
+              SizedBox(
+                width: 28,
+                child: Text(
+                  '${line.qty}',
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(fontWeight: FontWeight.w600),
+                ),
               ),
+              _StepperButton(icon: Icons.add, onTap: () => onQtyChanged!(line.qty + 1)),
+            ],
+          )
+        else
+          SizedBox(
+            width: 28,
+            child: Text(
+              '${line.qty}×',
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontWeight: FontWeight.w600, color: AppColors.textMuted),
             ),
-            _StepperButton(icon: Icons.add, onTap: () => onQtyChanged(line.qty + 1)),
-          ],
-        ),
+          ),
         const SizedBox(width: 10),
         SizedBox(
           width: 56,

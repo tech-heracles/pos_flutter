@@ -24,6 +24,9 @@ class Ticket {
     required this.lines,
     required this.operatorUid,
     required this.operatorName,
+    this.tableId,
+    this.zoneId,
+    this.currentRound = 0,
   });
 
   final String id;
@@ -35,7 +38,15 @@ class Ticket {
   final String operatorUid;
   final String operatorName;
 
+  /// Set only in BAR/RESTAURANT (tables) mode — ties this ticket to a table
+  /// so it can queue several sent rounds before one summary invoice closes
+  /// it out via completeTicket.
+  final String? tableId;
+  final String? zoneId;
+  final int currentRound;
+
   num get total => lines.fold<num>(0, (sum, l) => sum + l.lineTotal);
+  bool get hasPendingLines => lines.any((l) => l.isPending);
 
   factory Ticket.fromDoc(String id, Map<String, dynamic> data) {
     return Ticket(
@@ -50,6 +61,9 @@ class Ticket {
           .toList(),
       operatorUid: data['operatorUid'] as String? ?? '',
       operatorName: data['operatorName'] as String? ?? '',
+      tableId: data['tableId'] as String?,
+      zoneId: data['zoneId'] as String?,
+      currentRound: (data['currentRound'] as num?)?.toInt() ?? 0,
     );
   }
 }
