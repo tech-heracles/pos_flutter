@@ -5,7 +5,7 @@ import '../features/auth/application/auth_providers.dart';
 import '../features/pairing/application/pairing_providers.dart';
 import '../features/pairing/presentation/setup_screen.dart';
 import '../features/operator/presentation/operator_picker_screen.dart';
-import '../features/home/presentation/home_screen.dart';
+import '../features/sales/presentation/sales_screen.dart';
 
 /// Notifies go_router to re-run redirect whenever the paired-device state
 /// or the raw Firebase auth state changes. Listening to only one of these
@@ -54,7 +54,7 @@ final routerProvider = Provider<GoRouter>((ref) {
         path: '/operators',
         builder: (context, state) => const OperatorPickerScreen(),
       ),
-      GoRoute(path: '/home', builder: (context, state) => const HomeScreen()),
+      GoRoute(path: '/home', builder: (context, state) => const SalesScreen()),
     ],
   );
 });

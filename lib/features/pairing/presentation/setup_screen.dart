@@ -275,10 +275,10 @@ class _SetupScreenState extends ConsumerState<SetupScreen> {
         const SizedBox(height: 16),
         TextField(
           controller: _codeController,
-          keyboardType: TextInputType.number,
-          maxLength: 6,
+          textCapitalization: TextCapitalization.characters,
+          maxLength: 12,
           textAlign: TextAlign.center,
-          style: const TextStyle(fontSize: 22, letterSpacing: 6),
+          style: const TextStyle(fontSize: 22, letterSpacing: 4),
           decoration: const InputDecoration(labelText: 'Code', counterText: ''),
         ),
         const SizedBox(height: 12),
