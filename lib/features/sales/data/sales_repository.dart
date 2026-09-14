@@ -5,7 +5,6 @@ import '../domain/item_group.dart';
 import '../domain/pos_customer.dart';
 import '../domain/pos_item.dart';
 import '../domain/pos_location.dart';
-import '../domain/table_claim.dart';
 import '../domain/ticket.dart';
 import '../domain/ticket_line.dart';
 import '../domain/zone.dart';
@@ -14,6 +13,14 @@ import '../domain/zone.dart';
 /// the sale screen needs everything in memory at once for instant
 /// search/grouping/pricing — and this doubles as the data set Phase 3
 /// (offline) will cache locally.
+///
+/// Two parallel sets of ticket-shaped methods live here: the `Ticket`-named
+/// ones back simple/retail mode's free-form `tickets` collection (auto-id
+/// docs, several open at once); the `Order`-named ones back BAR/RESTAURANT
+/// mode's `orders` collection, where the document id is the tableId itself
+/// (at most one active, non-invoiced order per table) and completing one
+/// copies it into a separate `invoices` collection rather than just
+/// flipping a status field — see [createInvoice] for why.
 class SalesRepository {
   SalesRepository(this._firestore);
   final FirebaseFirestore _firestore;
@@ -94,7 +101,7 @@ class SalesRepository {
           .doc(businessUnitId)
           .collection('tickets');
 
-  CollectionReference<Map<String, dynamic>> _tableClaimsRef(
+  CollectionReference<Map<String, dynamic>> _ordersRef(
     String companyId,
     String businessUnitId,
   ) =>
@@ -103,7 +110,22 @@ class SalesRepository {
           .doc(companyId)
           .collection('businessUnits')
           .doc(businessUnitId)
-          .collection('tableClaims');
+          .collection('orders');
+
+  CollectionReference<Map<String, dynamic>> _invoicesRef(
+    String companyId,
+    String businessUnitId,
+  ) =>
+      _firestore
+          .collection('companies')
+          .doc(companyId)
+          .collection('businessUnits')
+          .doc(businessUnitId)
+          .collection('invoices');
+
+  // ---------------------------------------------------------------------
+  // Simple mode: free-form tickets
+  // ---------------------------------------------------------------------
 
   Stream<List<Ticket>> watchOpenTickets({
     required String companyId,
@@ -116,20 +138,6 @@ class SalesRepository {
         .map((snap) => snap.docs.map((d) => Ticket.fromDoc(d.id, d.data())).toList());
   }
 
-  /// Ownership/occupied info for one table — the source of truth for
-  /// "who has this table open" independent of whether an order has been
-  /// started on it yet (see [claimTable]).
-  Stream<TableClaim?> watchTableClaim({
-    required String companyId,
-    required String businessUnitId,
-    required String tableId,
-  }) {
-    return _tableClaimsRef(companyId, businessUnitId)
-        .doc(tableId)
-        .snapshots()
-        .map((snap) => TableClaim.fromDoc(snap.data()));
-  }
-
   Future<String> createTicket({
     required String companyId,
     required String businessUnitId,
@@ -138,8 +146,6 @@ class SalesRepository {
     required String locationCode,
     required String operatorUid,
     required String operatorName,
-    String? tableId,
-    String? zoneId,
   }) async {
     final ref = _ticketsRef(companyId, businessUnitId).doc();
     await ref.set({
@@ -150,89 +156,81 @@ class SalesRepository {
       'lines': <Map<String, dynamic>>[],
       'operatorUid': operatorUid,
       'operatorName': operatorName,
-      'tableId': tableId,
-      'zoneId': zoneId,
-      'currentRound': 0,
       'createdAt': FieldValue.serverTimestamp(),
       'updatedAt': FieldValue.serverTimestamp(),
     });
     return ref.id;
   }
 
-  /// Atomically opens a table for [operatorUid] — or, if someone already
-  /// has it, says who instead of taking it over. This is what prevents the
-  /// double-booking race where two operators tap the same "free" table at
-  /// the same moment: whichever transaction's write commits first wins on
-  /// the server, and the loser is told who already has it.
-  ///
-  /// Opening a table does NOT create an order/invoice — a table can sit
-  /// open with nothing on it yet (matches how a waiter actually works: seat
-  /// the guests, then take the order once they're ready). The first order
-  /// is created lazily by [addOrIncrementItem] once an item is actually
-  /// added.
-  Future<({bool claimedByMe, String ownerUid, String ownerName})> claimTable({
+  /// Plain optimistic update computed from [currentLines] — the caller's
+  /// already-fresh local ticket state (from the same `watchOpenTickets`
+  /// stream this screen renders from, which itself reflects Firestore's
+  /// latency-compensated pending writes). A transaction re-reading from the
+  /// server here would trade that instant local echo for a network round
+  /// trip on every tap, which is what actually caused visible lag — the
+  /// same-device tap sequence this guards is not truly concurrent, so the
+  /// extra round trip bought correctness the flow didn't need.
+  Future<void> addOrIncrementItem({
     required String companyId,
     required String businessUnitId,
-    required String tableId,
-    required String customerCode,
-    required String locationCode,
-    required String operatorUid,
-    required String operatorName,
+    required String ticketId,
+    required List<TicketLine> currentLines,
+    required String itemCode,
+    required String description,
+    required num unitPrice,
   }) {
-    final claimRef = _tableClaimsRef(companyId, businessUnitId).doc(tableId);
-
-    return _firestore.runTransaction((tx) async {
-      final claimSnap = await tx.get(claimRef);
-      final claim = claimSnap.data();
-      if (claim != null && claim['status'] == 'occupied') {
-        return (
-          claimedByMe: false,
-          ownerUid: claim['operatorUid'] as String? ?? '',
-          ownerName: claim['operatorName'] as String? ?? '',
-        );
-      }
-
-      tx.set(claimRef, {
-        'status': 'occupied',
-        'operatorUid': operatorUid,
-        'operatorName': operatorName,
-        'customerCode': customerCode,
-        'locationCode': locationCode,
-        'updatedAt': FieldValue.serverTimestamp(),
-      });
-      return (claimedByMe: true, ownerUid: operatorUid, ownerName: operatorName);
-    });
-  }
-
-  /// Leaves a table that was opened but never had an order started on it
-  /// (e.g. guests left before ordering) — just frees the claim, there's no
-  /// ticket to cancel.
-  Future<void> leaveEmptyTable({
-    required String companyId,
-    required String businessUnitId,
-    required String tableId,
-  }) {
-    return _releaseTableClaim(companyId, businessUnitId, tableId);
-  }
-
-  Future<void> _releaseTableClaim(
-    String companyId,
-    String businessUnitId,
-    String tableId,
-  ) {
-    return _tableClaimsRef(companyId, businessUnitId).doc(tableId).set({
-      'status': 'free',
-      'operatorUid': null,
-      'operatorName': null,
-      'customerCode': null,
-      'locationCode': null,
+    final lines = List<TicketLine>.from(currentLines);
+    final index = lines.indexWhere((l) => l.itemCode == itemCode);
+    if (index >= 0) {
+      lines[index] = lines[index].copyWith(qty: lines[index].qty + 1);
+    } else {
+      lines.add(TicketLine(
+        itemCode: itemCode,
+        description: description,
+        unitPrice: unitPrice,
+        qty: 1,
+      ));
+    }
+    return _ticketsRef(companyId, businessUnitId).doc(ticketId).update({
+      'lines': lines.map((l) => l.toMap()).toList(),
       'updatedAt': FieldValue.serverTimestamp(),
     });
   }
 
-  /// Full-array rewrite — only safe for mutations that aren't racing rapid
-  /// taps (e.g. re-pricing every line after a deliberate customer change).
-  Future<void> updateLines({
+  Future<void> setItemQty({
+    required String companyId,
+    required String businessUnitId,
+    required String ticketId,
+    required List<TicketLine> currentLines,
+    required String itemCode,
+    required num newQty,
+  }) {
+    final lines = List<TicketLine>.from(currentLines);
+    if (newQty <= 0) {
+      lines.removeWhere((l) => l.itemCode == itemCode);
+    } else {
+      final index = lines.indexWhere((l) => l.itemCode == itemCode);
+      if (index >= 0) lines[index] = lines[index].copyWith(qty: newQty);
+    }
+    return _ticketsRef(companyId, businessUnitId).doc(ticketId).update({
+      'lines': lines.map((l) => l.toMap()).toList(),
+      'updatedAt': FieldValue.serverTimestamp(),
+    });
+  }
+
+  Future<void> updateTicketCustomer({
+    required String companyId,
+    required String businessUnitId,
+    required String ticketId,
+    required String customerCode,
+  }) {
+    return _ticketsRef(companyId, businessUnitId).doc(ticketId).update({
+      'customerCode': customerCode,
+      'updatedAt': FieldValue.serverTimestamp(),
+    });
+  }
+
+  Future<void> updateTicketLines({
     required String companyId,
     required String businessUnitId,
     required String ticketId,
@@ -244,32 +242,62 @@ class SalesRepository {
     });
   }
 
-  /// Plain optimistic update computed from [currentLines] — the caller's
-  /// already-fresh local ticket state (from the same `watchOpenTickets`
-  /// stream this screen renders from, which itself reflects Firestore's
-  /// latency-compensated pending writes). A transaction re-reading from the
-  /// server here would trade that instant local echo for a network round
-  /// trip on every tap, which is what actually caused visible lag — the
-  /// same-device tap sequence this guards is not truly concurrent, so the
-  /// extra round trip bought correctness the flow didn't need.
-  ///
-  /// Only merges into a *pending* (not yet sent) line with the same item
-  /// code — an already-sent line from an earlier round is left alone so a
-  /// re-order starts a fresh pending line instead of reopening history.
-  ///
-  /// [ticketId] null means no order exists yet for this table (it's open
-  /// but nothing's been ordered) — this is where that first order gets
-  /// created, lazily, with just this one line. Returns the ticket id
-  /// (unchanged if one was already passed in).
-  Future<String> addOrIncrementItem({
+  Future<void> completeTicket({
     required String companyId,
     required String businessUnitId,
-    required String? ticketId,
+    required String ticketId,
+  }) {
+    return _ticketsRef(companyId, businessUnitId).doc(ticketId).update({
+      'status': 'completed',
+      'completedAt': FieldValue.serverTimestamp(),
+      'updatedAt': FieldValue.serverTimestamp(),
+    });
+  }
+
+  Future<void> cancelTicket({
+    required String companyId,
+    required String businessUnitId,
+    required String ticketId,
+  }) {
+    return _ticketsRef(companyId, businessUnitId).doc(ticketId).update({
+      'status': 'cancelled',
+      'updatedAt': FieldValue.serverTimestamp(),
+    });
+  }
+
+  // ---------------------------------------------------------------------
+  // BAR/RESTAURANT mode: table-keyed orders -> invoices
+  // ---------------------------------------------------------------------
+
+  /// All tables' active (not yet invoiced) orders for the BU. A table with
+  /// no order here is simply free — there's no separate "table is open"
+  /// marker; tapping into a table is pure navigation with no write (see
+  /// TablesScreen), so occupancy is exactly "does this table have an order
+  /// going," nothing more.
+  Stream<List<Ticket>> watchOpenOrders({
+    required String companyId,
+    required String businessUnitId,
+  }) {
+    return _ordersRef(companyId, businessUnitId)
+        .snapshots()
+        .map((snap) => snap.docs.map((d) => Ticket.fromDoc(d.id, d.data())).toList());
+  }
+
+  /// [currentLines] empty means (as far as this device's local state knows)
+  /// no order exists yet for this table — that first-ever add is the one
+  /// case that needs a transaction: two operators tapping items on the same
+  /// never-ordered table at once could otherwise both see "empty" and one's
+  /// plain `.set()` would silently clobber the other's. Once an order
+  /// exists, every later tap (the vast majority) goes through the fast
+  /// optimistic path exactly like the simple-mode ticket methods above.
+  Future<void> addOrIncrementOrderItem({
+    required String companyId,
+    required String businessUnitId,
+    required String tableId,
     required List<TicketLine> currentLines,
     required String itemCode,
     required String description,
     required num unitPrice,
-    String? tableId,
     String? zoneId,
     String? label,
     String? customerCode,
@@ -277,30 +305,57 @@ class SalesRepository {
     String? operatorUid,
     String? operatorName,
   }) async {
-    if (ticketId == null) {
-      final ref = _ticketsRef(companyId, businessUnitId).doc();
-      await ref.set({
-        'status': 'open',
-        'label': label,
-        'customerCode': customerCode,
-        'locationCode': locationCode,
-        'lines': [
-          TicketLine(
-            itemCode: itemCode,
-            description: description,
-            unitPrice: unitPrice,
-            qty: 1,
-          ).toMap(),
-        ],
-        'operatorUid': operatorUid,
-        'operatorName': operatorName,
-        'tableId': tableId,
-        'zoneId': zoneId,
-        'currentRound': 0,
-        'createdAt': FieldValue.serverTimestamp(),
-        'updatedAt': FieldValue.serverTimestamp(),
+    final ref = _ordersRef(companyId, businessUnitId).doc(tableId);
+
+    if (currentLines.isEmpty) {
+      await _firestore.runTransaction((tx) async {
+        final snap = await tx.get(ref);
+        if (snap.exists) {
+          // Lost the race — someone's order already exists server-side.
+          // Fold this tap into it instead of overwriting their lines.
+          final lines = (snap.data()?['lines'] as List<dynamic>? ?? [])
+              .whereType<Map<String, dynamic>>()
+              .map(TicketLine.fromMap)
+              .toList();
+          final index = lines.indexWhere((l) => l.itemCode == itemCode && l.isPending);
+          if (index >= 0) {
+            lines[index] = lines[index].copyWith(qty: lines[index].qty + 1);
+          } else {
+            lines.add(TicketLine(
+              itemCode: itemCode,
+              description: description,
+              unitPrice: unitPrice,
+              qty: 1,
+            ));
+          }
+          tx.update(ref, {
+            'lines': lines.map((l) => l.toMap()).toList(),
+            'updatedAt': FieldValue.serverTimestamp(),
+          });
+          return;
+        }
+        tx.set(ref, {
+          'label': label,
+          'customerCode': customerCode,
+          'locationCode': locationCode,
+          'lines': [
+            TicketLine(
+              itemCode: itemCode,
+              description: description,
+              unitPrice: unitPrice,
+              qty: 1,
+            ).toMap(),
+          ],
+          'operatorUid': operatorUid,
+          'operatorName': operatorName,
+          'tableId': tableId,
+          'zoneId': zoneId,
+          'currentRound': 0,
+          'createdAt': FieldValue.serverTimestamp(),
+          'updatedAt': FieldValue.serverTimestamp(),
+        });
       });
-      return ref.id;
+      return;
     }
 
     final lines = List<TicketLine>.from(currentLines);
@@ -315,20 +370,16 @@ class SalesRepository {
         qty: 1,
       ));
     }
-    await _ticketsRef(companyId, businessUnitId).doc(ticketId).update({
+    await ref.update({
       'lines': lines.map((l) => l.toMap()).toList(),
       'updatedAt': FieldValue.serverTimestamp(),
     });
-    return ticketId;
   }
 
-  /// Same optimistic-from-local-state approach as [addOrIncrementItem].
-  /// qty <= 0 removes the line. Only ever targets pending lines — quantity
-  /// on an already-sent round isn't editable from the cart.
-  Future<void> setItemQty({
+  Future<void> setOrderItemQty({
     required String companyId,
     required String businessUnitId,
-    required String ticketId,
+    required String tableId,
     required List<TicketLine> currentLines,
     required String itemCode,
     required num newQty,
@@ -340,20 +391,20 @@ class SalesRepository {
       final index = lines.indexWhere((l) => l.itemCode == itemCode && l.isPending);
       if (index >= 0) lines[index] = lines[index].copyWith(qty: newQty);
     }
-    return _ticketsRef(companyId, businessUnitId).doc(ticketId).update({
+    return _ordersRef(companyId, businessUnitId).doc(tableId).update({
       'lines': lines.map((l) => l.toMap()).toList(),
       'updatedAt': FieldValue.serverTimestamp(),
     });
   }
 
-  /// BAR/RESTAURANT mode: stamps every pending line with the next round
-  /// number so it's locked into that round's history, then bumps
-  /// [Ticket.currentRound]. The table keeps accumulating rounds until
-  /// completeTicket closes it with one summary invoice over every line.
-  Future<void> sendRound({
+  /// Stamps every pending line with the next round number so it's locked
+  /// into that round's history (one "send" = one kitchen/bar slip), then
+  /// bumps [Ticket.currentRound]. The order keeps accumulating rounds
+  /// until [createInvoice] closes it out.
+  Future<void> sendOrderRound({
     required String companyId,
     required String businessUnitId,
-    required String ticketId,
+    required String tableId,
     required List<TicketLine> currentLines,
     required int currentRound,
   }) {
@@ -361,79 +412,69 @@ class SalesRepository {
     final lines = currentLines
         .map((l) => l.isPending ? l.copyWith(roundNumber: nextRound) : l)
         .toList();
-    return _ticketsRef(companyId, businessUnitId).doc(ticketId).update({
+    return _ordersRef(companyId, businessUnitId).doc(tableId).update({
       'lines': lines.map((l) => l.toMap()).toList(),
       'currentRound': nextRound,
       'updatedAt': FieldValue.serverTimestamp(),
     });
   }
 
-  Future<void> updateCustomer({
+  Future<void> updateOrderCustomer({
     required String companyId,
     required String businessUnitId,
-    required String ticketId,
+    required String tableId,
     required String customerCode,
   }) {
-    return _ticketsRef(companyId, businessUnitId).doc(ticketId).update({
+    return _ordersRef(companyId, businessUnitId).doc(tableId).update({
       'customerCode': customerCode,
       'updatedAt': FieldValue.serverTimestamp(),
     });
   }
 
-  /// Closes the table's order out into an invoice (the fiscal document —
-  /// real fiscalization is future work, but this is the state-machine
-  /// boundary it will hang off). [tableId] is passed (rather than re-read
-  /// from the ticket) so this stays a plain caller-supplied write; when
-  /// present, the table's claim is released in the same transaction so a
-  /// stalled release can never leave an invoiced table stuck looking
-  /// occupied — a table can only be reopened once every order on it has
-  /// been invoiced.
-  Future<void> completeTicket({
+  Future<void> updateOrderLines({
     required String companyId,
     required String businessUnitId,
-    required String ticketId,
-    String? tableId,
+    required String tableId,
+    required List<TicketLine> lines,
   }) {
-    return _firestore.runTransaction((tx) async {
-      tx.update(_ticketsRef(companyId, businessUnitId).doc(ticketId), {
-        'status': 'completed',
-        'completedAt': FieldValue.serverTimestamp(),
-        'updatedAt': FieldValue.serverTimestamp(),
-      });
-      if (tableId != null) {
-        tx.set(_tableClaimsRef(companyId, businessUnitId).doc(tableId), {
-          'status': 'free',
-          'operatorUid': null,
-          'operatorName': null,
-          'customerCode': null,
-          'locationCode': null,
-          'updatedAt': FieldValue.serverTimestamp(),
-        });
-      }
+    return _ordersRef(companyId, businessUnitId).doc(tableId).update({
+      'lines': lines.map((l) => l.toMap()).toList(),
+      'updatedAt': FieldValue.serverTimestamp(),
     });
   }
 
-  Future<void> cancelTicket({
+  /// Closes a table's order out into an invoice — the fiscal document
+  /// (real fiscalization is future work, but this is the boundary it will
+  /// hang off). Orders and invoices are deliberately separate collections
+  /// rather than one doc with a status flip: once invoiced, the table's
+  /// order slot (keyed by tableId) is freed immediately for the next
+  /// party, while the invoice keeps its own permanent, never-reused id.
+  Future<void> createInvoice({
     required String companyId,
     required String businessUnitId,
-    required String ticketId,
-    String? tableId,
+    required String tableId,
   }) {
+    final orderRef = _ordersRef(companyId, businessUnitId).doc(tableId);
+    final invoiceRef = _invoicesRef(companyId, businessUnitId).doc();
     return _firestore.runTransaction((tx) async {
-      tx.update(_ticketsRef(companyId, businessUnitId).doc(ticketId), {
-        'status': 'cancelled',
-        'updatedAt': FieldValue.serverTimestamp(),
+      final snap = await tx.get(orderRef);
+      final data = snap.data();
+      if (data == null) return;
+      tx.set(invoiceRef, {
+        ...data,
+        'invoicedAt': FieldValue.serverTimestamp(),
       });
-      if (tableId != null) {
-        tx.set(_tableClaimsRef(companyId, businessUnitId).doc(tableId), {
-          'status': 'free',
-          'operatorUid': null,
-          'operatorName': null,
-          'customerCode': null,
-          'locationCode': null,
-          'updatedAt': FieldValue.serverTimestamp(),
-        });
-      }
+      tx.delete(orderRef);
     });
+  }
+
+  /// Discards an in-progress order without invoicing it — the table is
+  /// immediately free again.
+  Future<void> cancelOrder({
+    required String companyId,
+    required String businessUnitId,
+    required String tableId,
+  }) {
+    return _ordersRef(companyId, businessUnitId).doc(tableId).delete();
   }
 }

@@ -2,7 +2,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../app/theme.dart';
-import '../../pairing/application/pairing_providers.dart';
 import '../application/sales_providers.dart';
 import '../domain/item_category.dart';
 import '../domain/item_group.dart';
@@ -11,11 +10,12 @@ import '../domain/ticket.dart';
 import '../domain/ticket_line.dart';
 import 'cart_panel.dart';
 
-/// Item add/qty/customer/complete/cancel actions and the responsive
-/// browser+cart layout, shared between [SimpleSalesScreen] (many
-/// free-form tickets, tabs on top) and [TableSalesScreen] (exactly one
-/// table-bound ticket, no tabs) — the only real difference between the
-/// two screens is what sits above this workspace and what "done" means.
+/// The responsive item-browser + cart layout and the filtering logic
+/// behind it, shared between [SimpleSalesScreen] and [TableSalesScreen].
+/// Pure UI/filtering only — each screen owns its own item-tap/qty/
+/// customer/complete/cancel actions (they hit different Firestore
+/// collections: free-form `tickets` vs table-keyed `orders`/`invoices`)
+/// and passes them in as callbacks.
 mixin SalesWorkspaceMixin<T extends ConsumerStatefulWidget> on ConsumerState<T> {
   final searchController = TextEditingController();
   String search = '';
@@ -29,7 +29,7 @@ mixin SalesWorkspaceMixin<T extends ConsumerStatefulWidget> on ConsumerState<T> 
     super.dispose();
   }
 
-  num _priceForCode(PosItem item, String? customerCode, SalesCatalog catalog) {
+  num priceForCode(PosItem item, String? customerCode, SalesCatalog catalog) {
     String? levelFor(String code) {
       final matches = catalog.customers.where((c) => c.code == code);
       return matches.isNotEmpty ? matches.first.priceLevel : null;
@@ -43,7 +43,7 @@ mixin SalesWorkspaceMixin<T extends ConsumerStatefulWidget> on ConsumerState<T> 
   }
 
   num priceFor(PosItem item, Ticket ticket, SalesCatalog catalog) =>
-      _priceForCode(item, ticket.customerCode, catalog);
+      priceForCode(item, ticket.customerCode, catalog);
 
   List<PosItem> _activeVisibleItems(SalesCatalog catalog) {
     final allowedGroups = catalog.visibleItemGroupCodes;
@@ -64,189 +64,48 @@ mixin SalesWorkspaceMixin<T extends ConsumerStatefulWidget> on ConsumerState<T> 
     return letters;
   }
 
+  /// All active filters combine (AND) rather than override each other —
+  /// search, a letter, a group and a category can all narrow the result
+  /// together.
   List<PosItem> visibleItems(SalesCatalog catalog) {
-    final active = _activeVisibleItems(catalog);
+    var items = _activeVisibleItems(catalog);
     if (search.trim().isNotEmpty) {
       final q = search.trim().toLowerCase();
-      return active
+      items = items
           .where((i) =>
               i.description.toLowerCase().contains(q) || i.code.toLowerCase().contains(q))
           .toList();
     }
     if (selectedLetter != null) {
-      return active
-          .where((i) => i.description.toUpperCase().startsWith(selectedLetter!))
-          .toList();
+      items = items.where((i) => i.description.toUpperCase().startsWith(selectedLetter!)).toList();
     }
-    return active
-        .where((i) =>
-            i.groupCode == selectedGroupCode &&
-            (selectedCategoryCode == null || i.categoryCode == selectedCategoryCode))
-        .toList();
-  }
-
-  /// [ticket] null means no order exists yet for this table — the first
-  /// item tapped creates it lazily (see SalesRepository.addOrIncrementItem).
-  /// The extra params are only needed for that lazy-create path.
-  Future<void> addItem(
-    PosItem item,
-    Ticket? ticket,
-    SalesCatalog catalog, {
-    String? tableId,
-    String? zoneId,
-    String? label,
-    String? customerCode,
-    String? locationCode,
-    String? operatorUid,
-    String? operatorName,
-  }) async {
-    final paired = ref.read(pairedDeviceProvider).value;
-    if (paired == null) return;
-    await ref.read(salesRepositoryProvider).addOrIncrementItem(
-          companyId: paired.companyId,
-          businessUnitId: paired.businessUnitId,
-          ticketId: ticket?.id,
-          currentLines: ticket?.lines ?? const [],
-          itemCode: item.code,
-          description: item.description,
-          unitPrice: ticket != null
-              ? priceFor(item, ticket, catalog)
-              : _priceForCode(item, customerCode, catalog),
-          tableId: tableId,
-          zoneId: zoneId,
-          label: label,
-          customerCode: customerCode,
-          locationCode: locationCode,
-          operatorUid: operatorUid,
-          operatorName: operatorName,
-        );
-  }
-
-  Future<void> changeQty(Ticket ticket, TicketLine line, num newQty) async {
-    final paired = ref.read(pairedDeviceProvider).value;
-    if (paired == null) return;
-    await ref.read(salesRepositoryProvider).setItemQty(
-          companyId: paired.companyId,
-          businessUnitId: paired.businessUnitId,
-          ticketId: ticket.id,
-          currentLines: ticket.lines,
-          itemCode: line.itemCode,
-          newQty: newQty,
-        );
-  }
-
-  Future<void> sendRound(Ticket ticket) async {
-    final paired = ref.read(pairedDeviceProvider).value;
-    if (paired == null) return;
-    await ref.read(salesRepositoryProvider).sendRound(
-          companyId: paired.companyId,
-          businessUnitId: paired.businessUnitId,
-          ticketId: ticket.id,
-          currentLines: ticket.lines,
-          currentRound: ticket.currentRound,
-        );
-  }
-
-  Future<void> changeCustomer(Ticket ticket, String customerCode, SalesCatalog catalog) async {
-    final paired = ref.read(pairedDeviceProvider).value;
-    if (paired == null) return;
-
-    final repo = ref.read(salesRepositoryProvider);
-    await repo.updateCustomer(
-      companyId: paired.companyId,
-      businessUnitId: paired.businessUnitId,
-      ticketId: ticket.id,
-      customerCode: customerCode,
-    );
-
-    // Re-price existing lines against the newly selected customer's level.
-    final newLines = ticket.lines.map((line) {
-      final matches = catalog.items.where((i) => i.code == line.itemCode);
-      if (matches.isEmpty) return line;
-      return TicketLine(
-        itemCode: line.itemCode,
-        description: line.description,
-        unitPrice: _priceForCode(matches.first, customerCode, catalog),
-        qty: line.qty,
-        roundNumber: line.roundNumber,
-      );
-    }).toList();
-
-    await repo.updateLines(
-      companyId: paired.companyId,
-      businessUnitId: paired.businessUnitId,
-      ticketId: ticket.id,
-      lines: newLines,
-    );
-  }
-
-  /// Closes the order out into an invoice — the fiscal document (real
-  /// fiscalization is future work, but this is that boundary).
-  Future<void> completeTicket(Ticket ticket, {required VoidCallback onDone}) async {
-    final paired = ref.read(pairedDeviceProvider).value;
-    if (paired == null) return;
-    await ref.read(salesRepositoryProvider).completeTicket(
-          companyId: paired.companyId,
-          businessUnitId: paired.businessUnitId,
-          ticketId: ticket.id,
-          tableId: ticket.tableId,
-        );
-    if (mounted) onDone();
-  }
-
-  Future<void> cancelTicket(Ticket ticket, {required VoidCallback onDone}) async {
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Cancel this order?'),
-        content: Text('"${ticket.label}" and its items will be discarded.'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(context).pop(false),
-            child: const Text('No'),
-          ),
-          FilledButton(
-            style: FilledButton.styleFrom(backgroundColor: AppColors.error),
-            onPressed: () => Navigator.of(context).pop(true),
-            child: const Text('Cancel order'),
-          ),
-        ],
-      ),
-    );
-    if (confirmed != true) return;
-
-    final paired = ref.read(pairedDeviceProvider).value;
-    if (paired == null) return;
-    await ref.read(salesRepositoryProvider).cancelTicket(
-          companyId: paired.companyId,
-          businessUnitId: paired.businessUnitId,
-          ticketId: ticket.id,
-          tableId: ticket.tableId,
-        );
-    if (mounted) onDone();
+    if (selectedGroupCode != null) {
+      items = items.where((i) => i.groupCode == selectedGroupCode).toList();
+    }
+    if (selectedCategoryCode != null) {
+      items = items.where((i) => i.categoryCode == selectedCategoryCode).toList();
+    }
+    return items;
   }
 
   /// The item browser + cart, laid out side-by-side on wide screens or as
   /// a browser with a tap-to-open cart sheet on phone.
-  ///
-  /// [selected] is the order in progress, if any — a table can be open
-  /// with no order yet, which is why this (unlike the ticket-keyed
-  /// completeTicket/cancelTicket above) accepts a null ticket and still
-  /// renders a fully-interactive browser: tapping an item is what creates
-  /// the order lazily. [tableLabel]/[lockedByName]/[onLeaveTable] only
-  /// apply in that table-open-with-no-order-yet state.
   Widget buildWorkspace({
     required Ticket? selected,
     required SalesCatalog catalog,
     required bool readOnly,
+    required void Function(PosItem item) onItemTap,
+    required void Function(TicketLine line, num newQty) onQtyChanged,
+    required void Function(String customerCode) onCustomerChanged,
+    required VoidCallback onComplete,
+    required VoidCallback onCancel,
+    required VoidCallback onSendRound,
     String? tableLabel,
     String? lockedByName,
-    VoidCallback? onLeaveTable,
-    void Function(PosItem item)? onAddFirstItem,
   }) {
     return LayoutBuilder(
       builder: (context, constraints) {
-        final browser = _buildBrowser(catalog, selected, readOnly, onAddFirstItem);
+        final browser = _buildBrowser(catalog, selected, readOnly, onItemTap);
 
         Widget buildCart({required VoidCallback? closeSheet}) {
           return CartPanel(
@@ -255,18 +114,17 @@ mixin SalesWorkspaceMixin<T extends ConsumerStatefulWidget> on ConsumerState<T> 
             readOnly: readOnly,
             tableLabel: tableLabel,
             lockedByName: lockedByName,
-            onLeaveTable: onLeaveTable,
-            onQtyChanged: (line, qty) => changeQty(selected!, line, qty),
-            onCustomerChanged: (code) => changeCustomer(selected!, code, catalog),
+            onQtyChanged: onQtyChanged,
+            onCustomerChanged: onCustomerChanged,
             onComplete: () {
               closeSheet?.call();
-              completeTicket(selected!, onDone: () => onTicketClosed(selected));
+              onComplete();
             },
             onCancel: () {
               closeSheet?.call();
-              cancelTicket(selected!, onDone: () => onTicketClosed(selected));
+              onCancel();
             },
-            onSendRound: () => sendRound(selected!),
+            onSendRound: onSendRound,
           );
         }
 
@@ -325,26 +183,20 @@ mixin SalesWorkspaceMixin<T extends ConsumerStatefulWidget> on ConsumerState<T> 
     );
   }
 
-  /// Called once a ticket this workspace was showing gets completed or
-  /// cancelled. Override to navigate away (table screen) or just clear the
-  /// selection (simple screen, which has other tickets to fall back to).
-  void onTicketClosed(Ticket closed);
-
   Widget _buildBrowser(
     SalesCatalog catalog,
     Ticket? selected,
     bool readOnly,
-    void Function(PosItem item)? onAddFirstItem,
+    void Function(PosItem item) onItemTap,
   ) {
     final items = visibleItems(catalog);
-    final categoriesForGroup = catalog.categories
-        .where((c) => c.groupCodes.contains(selectedGroupCode))
-        .toList();
+    final categoriesForGroup = selectedGroupCode == null
+        ? const <ItemCategory>[]
+        : catalog.categories.where((c) => c.groupCodes.contains(selectedGroupCode)).toList();
     final letters = existingLetters(catalog);
 
     final searchAndLetters = _SearchAndLetters(
       controller: searchController,
-      search: search,
       letters: letters,
       selectedLetter: selectedLetter,
       onSearchChanged: (v) => setState(() => search = v),
@@ -357,13 +209,9 @@ mixin SalesWorkspaceMixin<T extends ConsumerStatefulWidget> on ConsumerState<T> 
       categories: categoriesForGroup,
       selectedGroupCode: selectedGroupCode,
       selectedCategoryCode: selectedCategoryCode,
-      dimmed: search.trim().isNotEmpty || selectedLetter != null,
       onGroupTap: (code) => setState(() {
         selectedGroupCode = code;
         selectedCategoryCode = null;
-        selectedLetter = null;
-        search = '';
-        searchController.clear();
       }),
       onCategoryTap: (code) => setState(() => selectedCategoryCode = code),
     );
@@ -372,15 +220,15 @@ mixin SalesWorkspaceMixin<T extends ConsumerStatefulWidget> on ConsumerState<T> 
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         Padding(
-          padding: const EdgeInsets.all(12),
+          padding: const EdgeInsets.fromLTRB(10, 8, 10, 6),
           child: LayoutBuilder(
             builder: (context, constraints) {
-              if (constraints.maxWidth >= 480) {
+              if (constraints.maxWidth >= 460) {
                 return Row(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    SizedBox(width: 176, child: searchAndLetters),
-                    const SizedBox(width: 12),
+                    SizedBox(width: 158, child: searchAndLetters),
+                    const SizedBox(width: 8),
                     Expanded(child: groupsAndCategories),
                   ],
                 );
@@ -389,7 +237,7 @@ mixin SalesWorkspaceMixin<T extends ConsumerStatefulWidget> on ConsumerState<T> 
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
                   searchAndLetters,
-                  const SizedBox(height: 10),
+                  const SizedBox(height: 6),
                   groupsAndCategories,
                 ],
               );
@@ -415,19 +263,11 @@ mixin SalesWorkspaceMixin<T extends ConsumerStatefulWidget> on ConsumerState<T> 
                     final item = items[index];
                     final price = selected != null
                         ? priceFor(item, selected, catalog)
-                        : _priceForCode(item, null, catalog);
+                        : priceForCode(item, null, catalog);
                     return ItemTile(
                       item: item,
                       price: price,
-                      onTap: readOnly
-                          ? null
-                          : () {
-                              if (selected == null) {
-                                onAddFirstItem?.call(item);
-                              } else {
-                                addItem(item, selected, catalog);
-                              }
-                            },
+                      onTap: readOnly ? null : () => onItemTap(item),
                     );
                   },
                 ),
@@ -440,7 +280,6 @@ mixin SalesWorkspaceMixin<T extends ConsumerStatefulWidget> on ConsumerState<T> 
 class _SearchAndLetters extends StatelessWidget {
   const _SearchAndLetters({
     required this.controller,
-    required this.search,
     required this.letters,
     required this.selectedLetter,
     required this.onSearchChanged,
@@ -448,7 +287,6 @@ class _SearchAndLetters extends StatelessWidget {
   });
 
   final TextEditingController controller;
-  final String search;
   final List<String> letters;
   final String? selectedLetter;
   final ValueChanged<String> onSearchChanged;
@@ -456,43 +294,45 @@ class _SearchAndLetters extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.all(8),
-      decoration: BoxDecoration(
-        color: AppColors.surface,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: AppColors.border),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          TextField(
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        SizedBox(
+          height: 32,
+          child: TextField(
             controller: controller,
+            style: const TextStyle(fontSize: 13),
             decoration: const InputDecoration(
-              prefixIcon: Icon(Icons.search, size: 18),
+              prefixIcon: Icon(Icons.search, size: 16),
+              prefixIconConstraints: BoxConstraints(minWidth: 30),
               hintText: 'Search…',
               isDense: true,
-              border: InputBorder.none,
+              contentPadding: EdgeInsets.symmetric(vertical: 6),
             ),
             onChanged: onSearchChanged,
           ),
-          if (letters.isNotEmpty) ...[
-            const Divider(height: 12, color: AppColors.border),
-            Wrap(
-              spacing: 4,
-              runSpacing: 4,
+        ),
+        if (letters.isNotEmpty) ...[
+          const SizedBox(height: 4),
+          SizedBox(
+            height: 24,
+            child: ListView(
+              scrollDirection: Axis.horizontal,
               children: [
                 for (final letter in letters)
-                  _LetterChip(
-                    letter: letter,
-                    selected: selectedLetter == letter,
-                    onTap: () => onLetterTap(letter),
+                  Padding(
+                    padding: const EdgeInsets.only(right: 3),
+                    child: _LetterChip(
+                      letter: letter,
+                      selected: selectedLetter == letter,
+                      onTap: () => onLetterTap(letter),
+                    ),
                   ),
               ],
             ),
-          ],
+          ),
         ],
-      ),
+      ],
     );
   }
 }
@@ -507,18 +347,18 @@ class _LetterChip extends StatelessWidget {
   Widget build(BuildContext context) {
     return Material(
       color: selected ? AppColors.orange : AppColors.surfaceHigh,
-      borderRadius: BorderRadius.circular(6),
+      borderRadius: BorderRadius.circular(5),
       child: InkWell(
-        borderRadius: BorderRadius.circular(6),
+        borderRadius: BorderRadius.circular(5),
         onTap: onTap,
         child: SizedBox(
-          width: 22,
-          height: 22,
+          width: 20,
+          height: 20,
           child: Center(
             child: Text(
               letter,
               style: TextStyle(
-                fontSize: 11,
+                fontSize: 10.5,
                 fontWeight: FontWeight.w700,
                 color: selected ? Colors.white : AppColors.textSecondary,
               ),
@@ -536,7 +376,6 @@ class _GroupsAndCategories extends StatelessWidget {
     required this.categories,
     required this.selectedGroupCode,
     required this.selectedCategoryCode,
-    required this.dimmed,
     required this.onGroupTap,
     required this.onCategoryTap,
   });
@@ -545,65 +384,74 @@ class _GroupsAndCategories extends StatelessWidget {
   final List<ItemCategory> categories;
   final String? selectedGroupCode;
   final String? selectedCategoryCode;
-
-  /// True while a search/letter filter is active — groups still work (tap
-  /// one to go back to browsing by group) but shouldn't look selected.
-  final bool dimmed;
-  final ValueChanged<String> onGroupTap;
+  final ValueChanged<String?> onGroupTap;
   final ValueChanged<String?> onCategoryTap;
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-      decoration: BoxDecoration(
-        color: AppColors.surface,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: AppColors.border),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Wrap(
-            spacing: 6,
-            runSpacing: 6,
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        SizedBox(
+          height: 26,
+          child: ListView(
+            scrollDirection: Axis.horizontal,
             children: [
+              Padding(
+                padding: const EdgeInsets.only(right: 5),
+                child: CompactChip(
+                  label: 'All',
+                  selected: selectedGroupCode == null,
+                  onSelected: () => onGroupTap(null),
+                ),
+              ),
               for (final group in groups)
-                CompactChip(
-                  label: group.description,
-                  selected: !dimmed && selectedGroupCode == group.code,
-                  onSelected: () => onGroupTap(group.code),
+                Padding(
+                  padding: const EdgeInsets.only(right: 5),
+                  child: CompactChip(
+                    label: group.description,
+                    selected: selectedGroupCode == group.code,
+                    onSelected: () => onGroupTap(group.code),
+                  ),
                 ),
             ],
           ),
-          if (categories.isNotEmpty) ...[
-            const SizedBox(height: 8),
-            Wrap(
-              spacing: 6,
-              runSpacing: 6,
+        ),
+        if (categories.isNotEmpty) ...[
+          const SizedBox(height: 4),
+          SizedBox(
+            height: 24,
+            child: ListView(
+              scrollDirection: Axis.horizontal,
               children: [
-                CompactChip(
-                  label: 'All',
-                  selected: !dimmed && selectedCategoryCode == null,
-                  onSelected: () => onCategoryTap(null),
+                Padding(
+                  padding: const EdgeInsets.only(right: 5),
+                  child: CompactChip(
+                    label: 'All',
+                    selected: selectedCategoryCode == null,
+                    onSelected: () => onCategoryTap(null),
+                  ),
                 ),
                 for (final category in categories)
-                  CompactChip(
-                    label: category.description,
-                    selected: !dimmed && selectedCategoryCode == category.code,
-                    onSelected: () => onCategoryTap(category.code),
+                  Padding(
+                    padding: const EdgeInsets.only(right: 5),
+                    child: CompactChip(
+                      label: category.description,
+                      selected: selectedCategoryCode == category.code,
+                      onSelected: () => onCategoryTap(category.code),
+                    ),
                   ),
               ],
             ),
-          ],
+          ),
         ],
-      ),
+      ],
     );
   }
 }
 
-/// Small-footprint ChoiceChip used for the group/category/zone rows — the
+/// Small-footprint ChoiceChip used for the group/category rows — the
 /// default ChoiceChip padding/density ate too much vertical space.
 class CompactChip extends StatelessWidget {
   const CompactChip({super.key, required this.label, required this.selected, required this.onSelected});
@@ -614,12 +462,12 @@ class CompactChip extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return ChoiceChip(
-      label: Text(label, style: const TextStyle(fontSize: 12)),
+      label: Text(label, style: const TextStyle(fontSize: 11.5)),
       selected: selected,
       onSelected: (_) => onSelected(),
       visualDensity: VisualDensity.compact,
       materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-      labelPadding: const EdgeInsets.symmetric(horizontal: 8),
+      labelPadding: const EdgeInsets.symmetric(horizontal: 7),
       padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 0),
     );
   }

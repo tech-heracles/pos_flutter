@@ -3,17 +3,16 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import '../../../app/theme.dart';
-import '../../auth/application/auth_providers.dart';
 import '../../operator/application/operator_providers.dart';
 import '../../pairing/application/pairing_providers.dart';
 import '../application/sales_providers.dart';
 import '../domain/ticket.dart';
 import '../domain/zone.dart';
 
-/// BAR/RESTAURANT mode home: pick a zone, then a table. Tapping a table
-/// opens it (or jumps into it if it's already yours) and pushes the
-/// single-table sales page keyed by tableId — a table can be open with no
-/// order on it yet, so there isn't always a ticket to key the route by.
+/// BAR/RESTAURANT mode home: pick a zone, then a table. Tapping a table is
+/// pure navigation — it doesn't write anything, so just looking at a table
+/// never affects it. A table shows as occupied purely because it has an
+/// active order; see TableSalesScreen for where that gets created.
 class TablesScreen extends ConsumerStatefulWidget {
   const TablesScreen({super.key});
 
@@ -24,36 +23,11 @@ class TablesScreen extends ConsumerStatefulWidget {
 class _TablesScreenState extends ConsumerState<TablesScreen> {
   String? _selectedZoneId;
 
-  Future<void> _onTableTap(Zone zone, ZoneTable table, SalesCatalog catalog) async {
-    final paired = ref.read(pairedDeviceProvider).value;
-    final user = ref.read(authStateChangesProvider).value;
-    if (paired == null || user == null) return;
-
-    final result = await ref.read(salesRepositoryProvider).claimTable(
-          companyId: paired.companyId,
-          businessUnitId: paired.businessUnitId,
-          tableId: table.id,
-          customerCode: catalog.defaultCustomerCode ?? '',
-          locationCode: catalog.defaultLocationCode ?? '',
-          operatorUid: user.uid,
-          operatorName: user.displayName ?? '',
-        );
-    if (!mounted) return;
-    if (!result.claimedByMe) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('${table.name} is already being served by ${result.ownerName}'),
-        ),
-      );
-    }
-    context.push('/home/table/${table.id}');
-  }
-
   @override
   Widget build(BuildContext context) {
     final paired = ref.watch(pairedDeviceProvider).value;
     final catalogAsync = ref.watch(salesCatalogProvider);
-    final ticketsAsync = ref.watch(openTicketsProvider);
+    final ordersAsync = ref.watch(openOrdersProvider);
 
     return Scaffold(
       appBar: AppBar(
@@ -91,16 +65,16 @@ class _TablesScreenState extends ConsumerState<TablesScreen> {
           }
           final zone = catalog.zones.firstWhere((z) => z.id == _selectedZoneId);
 
-          return ticketsAsync.when(
+          return ordersAsync.when(
             loading: () => const Center(child: CircularProgressIndicator(color: AppColors.orange)),
             error: (err, _) => Center(
               child: Text('Failed to load tables: $err',
                   style: const TextStyle(color: AppColors.textSecondary)),
             ),
-            data: (tickets) {
-              final ticketByTable = {
-                for (final t in tickets)
-                  if (t.tableId != null) t.tableId!: t,
+            data: (orders) {
+              final orderByTable = {
+                for (final o in orders)
+                  if (o.tableId != null) o.tableId!: o,
               };
 
               return Column(
@@ -146,8 +120,8 @@ class _TablesScreenState extends ConsumerState<TablesScreen> {
                               final table = zone.tables[index];
                               return _TableCard(
                                 table: table,
-                                ticket: ticketByTable[table.id],
-                                onTap: () => _onTableTap(zone, table, catalog),
+                                order: orderByTable[table.id],
+                                onTap: () => context.push('/home/table/${table.id}'),
                               );
                             },
                           ),
@@ -162,21 +136,18 @@ class _TablesScreenState extends ConsumerState<TablesScreen> {
   }
 }
 
-class _TableCard extends ConsumerWidget {
-  const _TableCard({required this.table, required this.ticket, required this.onTap});
+class _TableCard extends StatelessWidget {
+  const _TableCard({required this.table, required this.order, required this.onTap});
   final ZoneTable table;
-  final Ticket? ticket;
+  final Ticket? order;
   final VoidCallback onTap;
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    final claim = ref.watch(tableClaimProvider(table.id)).value;
-    final occupied = claim != null;
+  Widget build(BuildContext context) {
+    final occupied = order != null;
     final statusLabel = !occupied
         ? 'Free'
-        : ticket != null
-            ? '${claim.operatorName.isEmpty ? '?' : claim.operatorName} · ${ticket!.total.toStringAsFixed(0)}'
-            : '${claim.operatorName.isEmpty ? '?' : claim.operatorName} · open';
+        : '${order!.operatorName.isEmpty ? '?' : order!.operatorName} · ${order!.total.toStringAsFixed(0)}';
 
     return Material(
       color: occupied ? AppColors.orange.withValues(alpha: 0.12) : AppColors.surface,

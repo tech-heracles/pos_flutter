@@ -8,7 +8,6 @@ import '../domain/item_group.dart';
 import '../domain/pos_customer.dart';
 import '../domain/pos_item.dart';
 import '../domain/pos_location.dart';
-import '../domain/table_claim.dart';
 import '../domain/ticket.dart';
 import '../domain/zone.dart';
 
@@ -106,12 +105,14 @@ final openTicketsProvider = StreamProvider<List<Ticket>>((ref) {
       );
 });
 
-final tableClaimProvider = StreamProvider.family<TableClaim?, String>((ref, tableId) {
+/// One entry per table that currently has an active (not yet invoiced)
+/// order — a table missing here is simply free. See SalesRepository for
+/// why occupancy has no separate "claim" marker.
+final openOrdersProvider = StreamProvider<List<Ticket>>((ref) {
   final paired = ref.watch(pairedDeviceProvider).value;
   if (paired == null) return const Stream.empty();
-  return ref.watch(salesRepositoryProvider).watchTableClaim(
+  return ref.watch(salesRepositoryProvider).watchOpenOrders(
         companyId: paired.companyId,
         businessUnitId: paired.businessUnitId,
-        tableId: tableId,
       );
 });

@@ -18,7 +18,6 @@ class CartPanel extends StatelessWidget {
     required this.onSendRound,
     this.tableLabel,
     this.lockedByName,
-    this.onLeaveTable,
   });
 
   final Ticket? ticket;
@@ -38,7 +37,6 @@ class CartPanel extends StatelessWidget {
   /// the cart show "table open" instead of the generic empty state.
   final String? tableLabel;
   final String? lockedByName;
-  final VoidCallback? onLeaveTable;
 
   @override
   Widget build(BuildContext context) {
@@ -49,23 +47,11 @@ class CartPanel extends StatelessWidget {
           child: Text('No active ticket', style: TextStyle(color: AppColors.textSecondary)),
         );
       }
-      return Column(
-        children: [
-          if (readOnly) _LockBanner(name: lockedByName),
-          const Expanded(
-            child: Center(
-              child: Text('No order yet', style: TextStyle(color: AppColors.textMuted)),
-            ),
-          ),
-          if (!readOnly)
-            Padding(
-              padding: const EdgeInsets.all(16),
-              child: OutlinedButton(
-                onPressed: onLeaveTable,
-                child: const Text('Leave table'),
-              ),
-            ),
-        ],
+      // Table has no order yet — tapping an item is what starts one, so
+      // there's nothing to lock and nothing to "leave"; going back is just
+      // navigation.
+      return const Center(
+        child: Text('No order yet — tap an item to start', style: TextStyle(color: AppColors.textMuted)),
       );
     }
 

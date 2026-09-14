@@ -6,7 +6,9 @@ import '../../auth/application/auth_providers.dart';
 import '../../operator/application/operator_providers.dart';
 import '../../pairing/application/pairing_providers.dart';
 import '../application/sales_providers.dart';
+import '../domain/pos_item.dart';
 import '../domain/ticket.dart';
+import '../domain/ticket_line.dart';
 import 'sales_workspace_mixin.dart';
 
 /// Free-form multi-ticket flow (retail/simple mode) — several tickets can
@@ -48,9 +50,103 @@ class _SimpleSalesScreenState extends ConsumerState<SimpleSalesScreen>
     if (mounted) setState(() => _selectedTicketId = id);
   }
 
-  @override
-  void onTicketClosed(Ticket closed) {
-    setState(() => _selectedTicketId = null);
+  Future<void> _addItem(PosItem item, Ticket ticket, SalesCatalog catalog) async {
+    final paired = ref.read(pairedDeviceProvider).value;
+    if (paired == null) return;
+    await ref.read(salesRepositoryProvider).addOrIncrementItem(
+          companyId: paired.companyId,
+          businessUnitId: paired.businessUnitId,
+          ticketId: ticket.id,
+          currentLines: ticket.lines,
+          itemCode: item.code,
+          description: item.description,
+          unitPrice: priceFor(item, ticket, catalog),
+        );
+  }
+
+  Future<void> _changeQty(Ticket ticket, TicketLine line, num newQty) async {
+    final paired = ref.read(pairedDeviceProvider).value;
+    if (paired == null) return;
+    await ref.read(salesRepositoryProvider).setItemQty(
+          companyId: paired.companyId,
+          businessUnitId: paired.businessUnitId,
+          ticketId: ticket.id,
+          currentLines: ticket.lines,
+          itemCode: line.itemCode,
+          newQty: newQty,
+        );
+  }
+
+  Future<void> _changeCustomer(Ticket ticket, String customerCode, SalesCatalog catalog) async {
+    final paired = ref.read(pairedDeviceProvider).value;
+    if (paired == null) return;
+    final repo = ref.read(salesRepositoryProvider);
+    await repo.updateTicketCustomer(
+      companyId: paired.companyId,
+      businessUnitId: paired.businessUnitId,
+      ticketId: ticket.id,
+      customerCode: customerCode,
+    );
+
+    final newLines = ticket.lines.map((line) {
+      final matches = catalog.items.where((i) => i.code == line.itemCode);
+      if (matches.isEmpty) return line;
+      return TicketLine(
+        itemCode: line.itemCode,
+        description: line.description,
+        unitPrice: priceForCode(matches.first, customerCode, catalog),
+        qty: line.qty,
+      );
+    }).toList();
+
+    await repo.updateTicketLines(
+      companyId: paired.companyId,
+      businessUnitId: paired.businessUnitId,
+      ticketId: ticket.id,
+      lines: newLines,
+    );
+  }
+
+  Future<void> _completeTicket(Ticket ticket) async {
+    final paired = ref.read(pairedDeviceProvider).value;
+    if (paired == null) return;
+    await ref.read(salesRepositoryProvider).completeTicket(
+          companyId: paired.companyId,
+          businessUnitId: paired.businessUnitId,
+          ticketId: ticket.id,
+        );
+    if (mounted) setState(() => _selectedTicketId = null);
+  }
+
+  Future<void> _cancelTicket(Ticket ticket) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Cancel this ticket?'),
+        content: Text('"${ticket.label}" and its items will be discarded.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('No'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: AppColors.error),
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Cancel ticket'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+
+    final paired = ref.read(pairedDeviceProvider).value;
+    if (paired == null) return;
+    await ref.read(salesRepositoryProvider).cancelTicket(
+          companyId: paired.companyId,
+          businessUnitId: paired.businessUnitId,
+          ticketId: ticket.id,
+        );
+    if (mounted) setState(() => _selectedTicketId = null);
   }
 
   @override
@@ -75,10 +171,6 @@ class _SimpleSalesScreenState extends ConsumerState<SimpleSalesScreen>
               style: const TextStyle(color: AppColors.textSecondary)),
         ),
         data: (catalog) {
-          if (selectedGroupCode == null && catalog.visibleGroups.isNotEmpty) {
-            selectedGroupCode = catalog.visibleGroups.first.code;
-          }
-
           return ticketsAsync.when(
             loading: () => const Center(child: CircularProgressIndicator(color: AppColors.orange)),
             error: (err, _) => Center(
@@ -110,6 +202,12 @@ class _SimpleSalesScreenState extends ConsumerState<SimpleSalesScreen>
                       selected: selected,
                       catalog: catalog,
                       readOnly: false,
+                      onItemTap: (item) => _addItem(item, selected!, catalog),
+                      onQtyChanged: (line, qty) => _changeQty(selected!, line, qty),
+                      onCustomerChanged: (code) => _changeCustomer(selected!, code, catalog),
+                      onComplete: () => _completeTicket(selected!),
+                      onCancel: () => _cancelTicket(selected!),
+                      onSendRound: () {}, // simple mode has no round concept
                     ),
                   ),
                 ],
