@@ -73,8 +73,14 @@ class CartPanel extends StatelessWidget {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              Text(t.label, style: Theme.of(context).textTheme.titleMedium),
-              const SizedBox(height: 12),
+              // A table-bound ticket's label is just the table name, which
+              // the screen's AppBar already shows — repeating it here would
+              // be redundant. Free-form tickets still need it since the
+              // cart is the only place that says which one is selected.
+              if (t.tableId == null) ...[
+                Text(t.label, style: Theme.of(context).textTheme.titleMedium),
+                const SizedBox(height: 12),
+              ],
               DropdownButtonFormField<String>(
                 initialValue: catalog.customers.any((c) => c.code == t.customerCode)
                     ? t.customerCode
