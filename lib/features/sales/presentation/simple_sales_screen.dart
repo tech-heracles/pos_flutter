@@ -106,7 +106,11 @@ class _SimpleSalesScreenState extends ConsumerState<SimpleSalesScreen>
                   ),
                   const Divider(height: 1, color: AppColors.border),
                   Expanded(
-                    child: buildWorkspace(selected: selected, catalog: catalog),
+                    child: buildWorkspace(
+                      selected: selected,
+                      catalog: catalog,
+                      readOnly: false,
+                    ),
                   ),
                 ],
               );

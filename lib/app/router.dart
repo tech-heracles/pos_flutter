@@ -57,9 +57,9 @@ final routerProvider = Provider<GoRouter>((ref) {
       ),
       GoRoute(path: '/home', builder: (context, state) => const HomeGateScreen()),
       GoRoute(
-        path: '/home/table/:ticketId',
+        path: '/home/table/:tableId',
         builder: (context, state) =>
-            TableSalesScreen(ticketId: state.pathParameters['ticketId']!),
+            TableSalesScreen(tableId: state.pathParameters['tableId']!),
       ),
     ],
   );

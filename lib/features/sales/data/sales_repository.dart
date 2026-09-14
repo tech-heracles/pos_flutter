@@ -5,6 +5,7 @@ import '../domain/item_group.dart';
 import '../domain/pos_customer.dart';
 import '../domain/pos_item.dart';
 import '../domain/pos_location.dart';
+import '../domain/table_claim.dart';
 import '../domain/ticket.dart';
 import '../domain/ticket_line.dart';
 import '../domain/zone.dart';
@@ -115,6 +116,20 @@ class SalesRepository {
         .map((snap) => snap.docs.map((d) => Ticket.fromDoc(d.id, d.data())).toList());
   }
 
+  /// Ownership/occupied info for one table — the source of truth for
+  /// "who has this table open" independent of whether an order has been
+  /// started on it yet (see [claimTable]).
+  Stream<TableClaim?> watchTableClaim({
+    required String companyId,
+    required String businessUnitId,
+    required String tableId,
+  }) {
+    return _tableClaimsRef(companyId, businessUnitId)
+        .doc(tableId)
+        .snapshots()
+        .map((snap) => TableClaim.fromDoc(snap.data()));
+  }
+
   Future<String> createTicket({
     required String companyId,
     required String businessUnitId,
@@ -144,67 +159,74 @@ class SalesRepository {
     return ref.id;
   }
 
-  /// Atomically claims a table for [operatorUid] — or, if someone already
-  /// has it, hands back their existing ticket instead of creating a
-  /// competing one. This is what actually prevents the double-booking race
-  /// where two operators tap the same "free" table at the same moment:
-  /// whichever transaction's claim doc write commits first wins on the
-  /// server, and the loser is told who already has it rather than silently
-  /// creating a second ticket for the same physical table.
-  Future<({String ticketId, bool claimedByMe, String ownerUid, String ownerName})>
-      claimOrJoinTable({
+  /// Atomically opens a table for [operatorUid] — or, if someone already
+  /// has it, says who instead of taking it over. This is what prevents the
+  /// double-booking race where two operators tap the same "free" table at
+  /// the same moment: whichever transaction's write commits first wins on
+  /// the server, and the loser is told who already has it.
+  ///
+  /// Opening a table does NOT create an order/invoice — a table can sit
+  /// open with nothing on it yet (matches how a waiter actually works: seat
+  /// the guests, then take the order once they're ready). The first order
+  /// is created lazily by [addOrIncrementItem] once an item is actually
+  /// added.
+  Future<({bool claimedByMe, String ownerUid, String ownerName})> claimTable({
     required String companyId,
     required String businessUnitId,
     required String tableId,
-    required String zoneId,
-    required String tableName,
     required String customerCode,
     required String locationCode,
     required String operatorUid,
     required String operatorName,
   }) {
     final claimRef = _tableClaimsRef(companyId, businessUnitId).doc(tableId);
-    final ticketRef = _ticketsRef(companyId, businessUnitId).doc();
 
     return _firestore.runTransaction((tx) async {
       final claimSnap = await tx.get(claimRef);
       final claim = claimSnap.data();
       if (claim != null && claim['status'] == 'occupied') {
         return (
-          ticketId: claim['ticketId'] as String? ?? '',
           claimedByMe: false,
           ownerUid: claim['operatorUid'] as String? ?? '',
           ownerName: claim['operatorName'] as String? ?? '',
         );
       }
 
-      tx.set(ticketRef, {
-        'status': 'open',
-        'label': tableName,
-        'customerCode': customerCode,
-        'locationCode': locationCode,
-        'lines': <Map<String, dynamic>>[],
-        'operatorUid': operatorUid,
-        'operatorName': operatorName,
-        'tableId': tableId,
-        'zoneId': zoneId,
-        'currentRound': 0,
-        'createdAt': FieldValue.serverTimestamp(),
-        'updatedAt': FieldValue.serverTimestamp(),
-      });
       tx.set(claimRef, {
         'status': 'occupied',
-        'ticketId': ticketRef.id,
         'operatorUid': operatorUid,
         'operatorName': operatorName,
+        'customerCode': customerCode,
+        'locationCode': locationCode,
         'updatedAt': FieldValue.serverTimestamp(),
       });
-      return (
-        ticketId: ticketRef.id,
-        claimedByMe: true,
-        ownerUid: operatorUid,
-        ownerName: operatorName,
-      );
+      return (claimedByMe: true, ownerUid: operatorUid, ownerName: operatorName);
+    });
+  }
+
+  /// Leaves a table that was opened but never had an order started on it
+  /// (e.g. guests left before ordering) — just frees the claim, there's no
+  /// ticket to cancel.
+  Future<void> leaveEmptyTable({
+    required String companyId,
+    required String businessUnitId,
+    required String tableId,
+  }) {
+    return _releaseTableClaim(companyId, businessUnitId, tableId);
+  }
+
+  Future<void> _releaseTableClaim(
+    String companyId,
+    String businessUnitId,
+    String tableId,
+  ) {
+    return _tableClaimsRef(companyId, businessUnitId).doc(tableId).set({
+      'status': 'free',
+      'operatorUid': null,
+      'operatorName': null,
+      'customerCode': null,
+      'locationCode': null,
+      'updatedAt': FieldValue.serverTimestamp(),
     });
   }
 
@@ -234,15 +256,53 @@ class SalesRepository {
   /// Only merges into a *pending* (not yet sent) line with the same item
   /// code — an already-sent line from an earlier round is left alone so a
   /// re-order starts a fresh pending line instead of reopening history.
-  Future<void> addOrIncrementItem({
+  ///
+  /// [ticketId] null means no order exists yet for this table (it's open
+  /// but nothing's been ordered) — this is where that first order gets
+  /// created, lazily, with just this one line. Returns the ticket id
+  /// (unchanged if one was already passed in).
+  Future<String> addOrIncrementItem({
     required String companyId,
     required String businessUnitId,
-    required String ticketId,
+    required String? ticketId,
     required List<TicketLine> currentLines,
     required String itemCode,
     required String description,
     required num unitPrice,
-  }) {
+    String? tableId,
+    String? zoneId,
+    String? label,
+    String? customerCode,
+    String? locationCode,
+    String? operatorUid,
+    String? operatorName,
+  }) async {
+    if (ticketId == null) {
+      final ref = _ticketsRef(companyId, businessUnitId).doc();
+      await ref.set({
+        'status': 'open',
+        'label': label,
+        'customerCode': customerCode,
+        'locationCode': locationCode,
+        'lines': [
+          TicketLine(
+            itemCode: itemCode,
+            description: description,
+            unitPrice: unitPrice,
+            qty: 1,
+          ).toMap(),
+        ],
+        'operatorUid': operatorUid,
+        'operatorName': operatorName,
+        'tableId': tableId,
+        'zoneId': zoneId,
+        'currentRound': 0,
+        'createdAt': FieldValue.serverTimestamp(),
+        'updatedAt': FieldValue.serverTimestamp(),
+      });
+      return ref.id;
+    }
+
     final lines = List<TicketLine>.from(currentLines);
     final index = lines.indexWhere((l) => l.itemCode == itemCode && l.isPending);
     if (index >= 0) {
@@ -255,10 +315,11 @@ class SalesRepository {
         qty: 1,
       ));
     }
-    return _ticketsRef(companyId, businessUnitId).doc(ticketId).update({
+    await _ticketsRef(companyId, businessUnitId).doc(ticketId).update({
       'lines': lines.map((l) => l.toMap()).toList(),
       'updatedAt': FieldValue.serverTimestamp(),
     });
+    return ticketId;
   }
 
   /// Same optimistic-from-local-state approach as [addOrIncrementItem].
@@ -319,10 +380,14 @@ class SalesRepository {
     });
   }
 
-  /// [tableId] is passed (rather than re-read from the ticket) so this
-  /// stays a plain caller-supplied write; when present, the table's claim
-  /// is released in the same transaction so a stalled release can never
-  /// leave a completed table stuck looking occupied.
+  /// Closes the table's order out into an invoice (the fiscal document —
+  /// real fiscalization is future work, but this is the state-machine
+  /// boundary it will hang off). [tableId] is passed (rather than re-read
+  /// from the ticket) so this stays a plain caller-supplied write; when
+  /// present, the table's claim is released in the same transaction so a
+  /// stalled release can never leave an invoiced table stuck looking
+  /// occupied — a table can only be reopened once every order on it has
+  /// been invoiced.
   Future<void> completeTicket({
     required String companyId,
     required String businessUnitId,
@@ -338,9 +403,10 @@ class SalesRepository {
       if (tableId != null) {
         tx.set(_tableClaimsRef(companyId, businessUnitId).doc(tableId), {
           'status': 'free',
-          'ticketId': null,
           'operatorUid': null,
           'operatorName': null,
+          'customerCode': null,
+          'locationCode': null,
           'updatedAt': FieldValue.serverTimestamp(),
         });
       }
@@ -361,9 +427,10 @@ class SalesRepository {
       if (tableId != null) {
         tx.set(_tableClaimsRef(companyId, businessUnitId).doc(tableId), {
           'status': 'free',
-          'ticketId': null,
           'operatorUid': null,
           'operatorName': null,
+          'customerCode': null,
+          'locationCode': null,
           'updatedAt': FieldValue.serverTimestamp(),
         });
       }

@@ -8,6 +8,7 @@ import '../domain/item_group.dart';
 import '../domain/pos_customer.dart';
 import '../domain/pos_item.dart';
 import '../domain/pos_location.dart';
+import '../domain/table_claim.dart';
 import '../domain/ticket.dart';
 import '../domain/zone.dart';
 
@@ -102,5 +103,15 @@ final openTicketsProvider = StreamProvider<List<Ticket>>((ref) {
   return ref.watch(salesRepositoryProvider).watchOpenTickets(
         companyId: paired.companyId,
         businessUnitId: paired.businessUnitId,
+      );
+});
+
+final tableClaimProvider = StreamProvider.family<TableClaim?, String>((ref, tableId) {
+  final paired = ref.watch(pairedDeviceProvider).value;
+  if (paired == null) return const Stream.empty();
+  return ref.watch(salesRepositoryProvider).watchTableClaim(
+        companyId: paired.companyId,
+        businessUnitId: paired.businessUnitId,
+        tableId: tableId,
       );
 });

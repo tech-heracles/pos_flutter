@@ -16,13 +16,16 @@ class CartPanel extends StatelessWidget {
     required this.onComplete,
     required this.onCancel,
     required this.onSendRound,
+    this.tableLabel,
+    this.lockedByName,
+    this.onLeaveTable,
   });
 
   final Ticket? ticket;
   final SalesCatalog catalog;
 
-  /// True when this table's ticket belongs to another operator — the
-  /// whole cart becomes look-but-don't-touch.
+  /// True when this table belongs to another operator — the whole cart
+  /// becomes look-but-don't-touch.
   final bool readOnly;
   final void Function(TicketLine line, num newQty) onQtyChanged;
   final void Function(String customerCode) onCustomerChanged;
@@ -30,12 +33,39 @@ class CartPanel extends StatelessWidget {
   final VoidCallback onCancel;
   final VoidCallback onSendRound;
 
+  /// Non-null only for a table context (BAR/RESTAURANT). A table can be
+  /// open with no order yet — [ticket] is then null but this still lets
+  /// the cart show "table open" instead of the generic empty state.
+  final String? tableLabel;
+  final String? lockedByName;
+  final VoidCallback? onLeaveTable;
+
   @override
   Widget build(BuildContext context) {
     final t = ticket;
     if (t == null) {
-      return const Center(
-        child: Text('No active ticket', style: TextStyle(color: AppColors.textSecondary)),
+      if (tableLabel == null) {
+        return const Center(
+          child: Text('No active ticket', style: TextStyle(color: AppColors.textSecondary)),
+        );
+      }
+      return Column(
+        children: [
+          if (readOnly) _LockBanner(name: lockedByName),
+          const Expanded(
+            child: Center(
+              child: Text('No order yet', style: TextStyle(color: AppColors.textMuted)),
+            ),
+          ),
+          if (!readOnly)
+            Padding(
+              padding: const EdgeInsets.all(16),
+              child: OutlinedButton(
+                onPressed: onLeaveTable,
+                child: const Text('Leave table'),
+              ),
+            ),
+        ],
       );
     }
 
@@ -46,28 +76,7 @@ class CartPanel extends StatelessWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        if (readOnly)
-          Container(
-            width: double.infinity,
-            color: AppColors.error.withValues(alpha: 0.15),
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-            child: Row(
-              children: [
-                const Icon(Icons.lock_outline, size: 16, color: AppColors.error),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    'Locked — being served by ${t.operatorName.isEmpty ? 'another operator' : t.operatorName}',
-                    style: const TextStyle(
-                      color: AppColors.error,
-                      fontWeight: FontWeight.w600,
-                      fontSize: 12.5,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
+        if (readOnly) _LockBanner(name: t.operatorName),
         Padding(
           padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
           child: Column(
@@ -138,30 +147,60 @@ class CartPanel extends StatelessWidget {
                 ],
               ),
               const SizedBox(height: 14),
-              // Only table-bound tickets (BAR/RESTAURANT mode) queue rounds —
+              // Only table-bound tickets (BAR/RESTAURANT mode) queue orders —
               // a free-form ticket has no "sent" concept to distinguish.
               if (t.tableId != null) ...[
                 OutlinedButton.icon(
                   onPressed: (!readOnly && t.hasPendingLines) ? onSendRound : null,
                   icon: const Icon(Icons.outbound, size: 18),
-                  label: Text(t.currentRound == 0 ? 'Send order' : 'Send new round'),
+                  label: Text(t.currentRound == 0 ? 'Send order' : 'Send new order'),
                 ),
                 const SizedBox(height: 10),
               ],
               FilledButton(
                 onPressed: (!readOnly && t.lines.isNotEmpty) ? onComplete : null,
-                child: const Text('Complete Sale'),
+                child: const Text('Create Invoice'),
               ),
               const SizedBox(height: 6),
               TextButton(
                 onPressed: readOnly ? null : onCancel,
                 style: TextButton.styleFrom(foregroundColor: AppColors.error),
-                child: const Text('Cancel ticket'),
+                child: const Text('Cancel order'),
               ),
             ],
           ),
         ),
       ],
+    );
+  }
+}
+
+class _LockBanner extends StatelessWidget {
+  const _LockBanner({required this.name});
+  final String? name;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      color: AppColors.error.withValues(alpha: 0.15),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      child: Row(
+        children: [
+          const Icon(Icons.lock_outline, size: 16, color: AppColors.error),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              'Locked — being served by ${(name == null || name!.isEmpty) ? 'another operator' : name}',
+              style: const TextStyle(
+                color: AppColors.error,
+                fontWeight: FontWeight.w600,
+                fontSize: 12.5,
+              ),
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -195,7 +234,7 @@ class _CartLines extends StatelessWidget {
           Padding(
             padding: const EdgeInsets.only(bottom: 6),
             child: Text(
-              'Round $round · sent',
+              'Order $round · sent',
               style: const TextStyle(
                 fontSize: 11,
                 fontWeight: FontWeight.w700,

@@ -11,10 +11,9 @@ import '../domain/ticket.dart';
 import '../domain/zone.dart';
 
 /// BAR/RESTAURANT mode home: pick a zone, then a table. Tapping a table
-/// claims it (or joins it if it's already yours) and pushes the
-/// single-table sales page — this screen shows nothing else, so there's
-/// no leftover cart/browser state to reset when the operator comes back
-/// to it after closing a table out.
+/// opens it (or jumps into it if it's already yours) and pushes the
+/// single-table sales page keyed by tableId — a table can be open with no
+/// order on it yet, so there isn't always a ticket to key the route by.
 class TablesScreen extends ConsumerStatefulWidget {
   const TablesScreen({super.key});
 
@@ -30,12 +29,10 @@ class _TablesScreenState extends ConsumerState<TablesScreen> {
     final user = ref.read(authStateChangesProvider).value;
     if (paired == null || user == null) return;
 
-    final result = await ref.read(salesRepositoryProvider).claimOrJoinTable(
+    final result = await ref.read(salesRepositoryProvider).claimTable(
           companyId: paired.companyId,
           businessUnitId: paired.businessUnitId,
           tableId: table.id,
-          zoneId: zone.id,
-          tableName: table.name,
           customerCode: catalog.defaultCustomerCode ?? '',
           locationCode: catalog.defaultLocationCode ?? '',
           operatorUid: user.uid,
@@ -49,7 +46,7 @@ class _TablesScreenState extends ConsumerState<TablesScreen> {
         ),
       );
     }
-    context.push('/home/table/${result.ticketId}');
+    context.push('/home/table/${table.id}');
   }
 
   @override
@@ -165,15 +162,22 @@ class _TablesScreenState extends ConsumerState<TablesScreen> {
   }
 }
 
-class _TableCard extends StatelessWidget {
+class _TableCard extends ConsumerWidget {
   const _TableCard({required this.table, required this.ticket, required this.onTap});
   final ZoneTable table;
   final Ticket? ticket;
   final VoidCallback onTap;
 
   @override
-  Widget build(BuildContext context) {
-    final occupied = ticket != null;
+  Widget build(BuildContext context, WidgetRef ref) {
+    final claim = ref.watch(tableClaimProvider(table.id)).value;
+    final occupied = claim != null;
+    final statusLabel = !occupied
+        ? 'Free'
+        : ticket != null
+            ? '${claim.operatorName.isEmpty ? '?' : claim.operatorName} · ${ticket!.total.toStringAsFixed(0)}'
+            : '${claim.operatorName.isEmpty ? '?' : claim.operatorName} · open';
+
     return Material(
       color: occupied ? AppColors.orange.withValues(alpha: 0.12) : AppColors.surface,
       borderRadius: BorderRadius.circular(16),
@@ -202,9 +206,7 @@ class _TableCard extends StatelessWidget {
               ),
               const SizedBox(height: 2),
               Text(
-                occupied
-                    ? '${ticket!.operatorName.isEmpty ? '?' : ticket!.operatorName} · ${ticket!.total.toStringAsFixed(0)}'
-                    : 'Free',
+                statusLabel,
                 overflow: TextOverflow.ellipsis,
                 style: TextStyle(
                   fontSize: 12,
