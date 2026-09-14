@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../app/theme.dart';
 import '../../auth/application/auth_providers.dart';
+import '../../connectivity/presentation/offline_banner.dart';
 import '../../operator/application/operator_providers.dart';
 import '../../pairing/application/pairing_providers.dart';
 import '../application/sales_providers.dart';
@@ -190,6 +191,7 @@ class _SimpleSalesScreenState extends ConsumerState<SimpleSalesScreen>
 
               return Column(
                 children: [
+                  const OfflineBanner(),
                   _TicketTabsBar(
                     tickets: tickets,
                     selectedId: selected?.id,

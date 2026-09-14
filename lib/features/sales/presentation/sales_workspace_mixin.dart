@@ -102,6 +102,7 @@ mixin SalesWorkspaceMixin<T extends ConsumerStatefulWidget> on ConsumerState<T> 
     required VoidCallback onSendRound,
     String? tableLabel,
     String? lockedByName,
+    bool isOnline = true,
   }) {
     return LayoutBuilder(
       builder: (context, constraints) {
@@ -114,6 +115,7 @@ mixin SalesWorkspaceMixin<T extends ConsumerStatefulWidget> on ConsumerState<T> 
             readOnly: readOnly,
             tableLabel: tableLabel,
             lockedByName: lockedByName,
+            isOnline: isOnline,
             onQtyChanged: onQtyChanged,
             onCustomerChanged: onCustomerChanged,
             onComplete: () {

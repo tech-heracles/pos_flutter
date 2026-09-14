@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import '../../../app/theme.dart';
+import '../../connectivity/presentation/offline_banner.dart';
 import '../../operator/application/operator_providers.dart';
 import '../../pairing/application/pairing_providers.dart';
 import '../application/sales_providers.dart';
@@ -80,6 +81,7 @@ class _TablesScreenState extends ConsumerState<TablesScreen> {
               return Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
+                  const OfflineBanner(),
                   SizedBox(
                     height: 44,
                     child: ListView(

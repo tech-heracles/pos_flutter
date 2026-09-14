@@ -284,12 +284,25 @@ class SalesRepository {
   }
 
   /// [currentLines] empty means (as far as this device's local state knows)
-  /// no order exists yet for this table — that first-ever add is the one
-  /// case that needs a transaction: two operators tapping items on the same
-  /// never-ordered table at once could otherwise both see "empty" and one's
-  /// plain `.set()` would silently clobber the other's. Once an order
-  /// exists, every later tap (the vast majority) goes through the fast
-  /// optimistic path exactly like the simple-mode ticket methods above.
+  /// no order exists yet for this table. That first-ever add used to go
+  /// through a transaction that re-read the server and merged into a
+  /// winner's order if one already existed — but a transaction needs a
+  /// live round trip, so offline it just hangs with no optimistic echo,
+  /// which is exactly the case offline mode most needs to keep working.
+  /// This is a plain `set()` instead: it queues and echoes through the
+  /// listener like every other write here, online or off. If another
+  /// operator's order already exists server-side by the time this reaches
+  /// the backend (two devices tapping the same never-ordered table at
+  /// once, or two offline devices both starting one) there's no silent
+  /// clobber — Firestore evaluates a `set()` against an existing doc as an
+  /// update, and the `orders` rule rejects that unless `operatorUid`
+  /// matches, so the loser's write is rejected outright and its local
+  /// cache entry is rolled back automatically (see TableSalesScreen's
+  /// permission-denied handling). What's lost versus the old transaction
+  /// is the convenience of auto-merging the loser's tap into the winner's
+  /// order — an acceptable trade since that convenience only ever applied
+  /// to a same-instant double-tap, not the offline case this is really
+  /// for.
   Future<void> addOrIncrementOrderItem({
     required String companyId,
     required String businessUnitId,
@@ -304,60 +317,8 @@ class SalesRepository {
     String? locationCode,
     String? operatorUid,
     String? operatorName,
-  }) async {
+  }) {
     final ref = _ordersRef(companyId, businessUnitId).doc(tableId);
-
-    if (currentLines.isEmpty) {
-      await _firestore.runTransaction((tx) async {
-        final snap = await tx.get(ref);
-        if (snap.exists) {
-          // Lost the race — someone's order already exists server-side.
-          // Fold this tap into it instead of overwriting their lines.
-          final lines = (snap.data()?['lines'] as List<dynamic>? ?? [])
-              .whereType<Map<String, dynamic>>()
-              .map(TicketLine.fromMap)
-              .toList();
-          final index = lines.indexWhere((l) => l.itemCode == itemCode && l.isPending);
-          if (index >= 0) {
-            lines[index] = lines[index].copyWith(qty: lines[index].qty + 1);
-          } else {
-            lines.add(TicketLine(
-              itemCode: itemCode,
-              description: description,
-              unitPrice: unitPrice,
-              qty: 1,
-            ));
-          }
-          tx.update(ref, {
-            'lines': lines.map((l) => l.toMap()).toList(),
-            'updatedAt': FieldValue.serverTimestamp(),
-          });
-          return;
-        }
-        tx.set(ref, {
-          'label': label,
-          'customerCode': customerCode,
-          'locationCode': locationCode,
-          'lines': [
-            TicketLine(
-              itemCode: itemCode,
-              description: description,
-              unitPrice: unitPrice,
-              qty: 1,
-            ).toMap(),
-          ],
-          'operatorUid': operatorUid,
-          'operatorName': operatorName,
-          'tableId': tableId,
-          'zoneId': zoneId,
-          'currentRound': 0,
-          'createdAt': FieldValue.serverTimestamp(),
-          'updatedAt': FieldValue.serverTimestamp(),
-        });
-      });
-      return;
-    }
-
     final lines = List<TicketLine>.from(currentLines);
     final index = lines.indexWhere((l) => l.itemCode == itemCode && l.isPending);
     if (index >= 0) {
@@ -370,7 +331,24 @@ class SalesRepository {
         qty: 1,
       ));
     }
-    await ref.update({
+
+    if (currentLines.isEmpty) {
+      return ref.set({
+        'label': label,
+        'customerCode': customerCode,
+        'locationCode': locationCode,
+        'lines': lines.map((l) => l.toMap()).toList(),
+        'operatorUid': operatorUid,
+        'operatorName': operatorName,
+        'tableId': tableId,
+        'zoneId': zoneId,
+        'currentRound': 0,
+        'createdAt': FieldValue.serverTimestamp(),
+        'updatedAt': FieldValue.serverTimestamp(),
+      });
+    }
+
+    return ref.update({
       'lines': lines.map((l) => l.toMap()).toList(),
       'updatedAt': FieldValue.serverTimestamp(),
     });
@@ -449,6 +427,14 @@ class SalesRepository {
   /// rather than one doc with a status flip: once invoiced, the table's
   /// order slot (keyed by tableId) is freed immediately for the next
   /// party, while the invoice keeps its own permanent, never-reused id.
+  ///
+  /// Deliberately still a transaction, unlike [addOrIncrementOrderItem] —
+  /// which means it needs a live connection and simply won't resolve
+  /// offline. That's intentional, not an oversight: closing out a table is
+  /// the fiscal boundary, and fiscalization itself will require a
+  /// real-time round trip anyway, so there's no point pretending this step
+  /// can be queued. The UI gates the button on isOnlineProvider so an
+  /// operator never taps it into a silent hang.
   Future<void> createInvoice({
     required String companyId,
     required String businessUnitId,

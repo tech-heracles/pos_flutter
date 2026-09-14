@@ -5,6 +5,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import '../../../app/theme.dart';
 import '../../auth/application/auth_providers.dart';
+import '../../connectivity/application/connectivity_providers.dart';
+import '../../connectivity/presentation/offline_banner.dart';
 import '../../pairing/application/pairing_providers.dart';
 import '../application/sales_providers.dart';
 import '../domain/pos_item.dart';
@@ -76,12 +78,23 @@ class _TableSalesScreenState extends ConsumerState<TableSalesScreen>
           operatorName: user?.displayName ?? '',
         );
     } on FirebaseException catch (e) {
-      // Extremely rare: lost a first-tap race and our fallback merge
-      // attempt landed after the winner's order was already committed and
-      // rules rejected it as a non-owner write. The stream will correct
-      // the UI to show it locked to whoever actually won — nothing else
-      // to do here.
+      // Lost the race on a table's first order — someone else's order
+      // already exists server-side and rules rejected this write as a
+      // non-owner update (see SalesRepository.addOrIncrementOrderItem).
+      // The stream self-corrects either way (this device's local order
+      // rolls back to whatever's actually on the server); this is just a
+      // heads-up for the rare case it happened, most likely because this
+      // write had been queued offline for a while before the conflict
+      // could even be discovered.
       if (e.code != 'permission-denied') rethrow;
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('This table was already taken by another operator — your tap didn\'t apply'),
+            backgroundColor: AppColors.error,
+          ),
+        );
+      }
     }
   }
 
@@ -188,12 +201,28 @@ class _TableSalesScreenState extends ConsumerState<TableSalesScreen>
     final catalogAsync = ref.watch(salesCatalogProvider);
     final ordersAsync = ref.watch(openOrdersProvider);
     final myUid = ref.watch(authStateChangesProvider).value?.uid;
+    final isOnline = ref.watch(isOnlineProvider).value ?? true;
 
     return Scaffold(
       appBar: AppBar(
         title: Text(catalogAsync.value != null ? _tableName(catalogAsync.value!) : 'Table'),
       ),
-      body: catalogAsync.when(
+      body: Column(
+        children: [
+          const OfflineBanner(),
+          Expanded(child: _body(catalogAsync, ordersAsync, myUid, isOnline)),
+        ],
+      ),
+    );
+  }
+
+  Widget _body(
+    AsyncValue<SalesCatalog> catalogAsync,
+    AsyncValue<List<Ticket>> ordersAsync,
+    String? myUid,
+    bool isOnline,
+  ) {
+    return catalogAsync.when(
         loading: () => const Center(child: CircularProgressIndicator(color: AppColors.orange)),
         error: (err, _) => Center(
           child: Text('Failed to load catalog: $err',
@@ -218,6 +247,7 @@ class _TableSalesScreenState extends ConsumerState<TableSalesScreen>
                 readOnly: readOnly,
                 tableLabel: _tableName(catalog),
                 lockedByName: order?.operatorName,
+                isOnline: isOnline,
                 onItemTap: (item) => _addItem(item, order, catalog),
                 onQtyChanged: (line, qty) => _changeQty(order!, line, qty),
                 onCustomerChanged: (code) => _changeCustomer(order!, code, catalog),
@@ -228,7 +258,6 @@ class _TableSalesScreenState extends ConsumerState<TableSalesScreen>
             },
           );
         },
-      ),
     );
   }
 }

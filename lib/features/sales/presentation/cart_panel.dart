@@ -18,6 +18,7 @@ class CartPanel extends StatelessWidget {
     required this.onSendRound,
     this.tableLabel,
     this.lockedByName,
+    this.isOnline = true,
   });
 
   final Ticket? ticket;
@@ -37,6 +38,13 @@ class CartPanel extends StatelessWidget {
   /// the cart show "table open" instead of the generic empty state.
   final String? tableLabel;
   final String? lockedByName;
+
+  /// False only when this device has lost its Firestore connection. Every
+  /// other action here queues fine offline and syncs later, but closing a
+  /// table out into an invoice is a real transaction (see
+  /// SalesRepository.createInvoice) — it can't be queued, so the button is
+  /// disabled instead of tapping into a silent hang.
+  final bool isOnline;
 
   @override
   Widget build(BuildContext context) {
@@ -143,9 +151,13 @@ class CartPanel extends StatelessWidget {
                 ),
                 const SizedBox(height: 10),
               ],
-              FilledButton(
-                onPressed: (!readOnly && t.lines.isNotEmpty) ? onComplete : null,
-                child: const Text('Create Invoice'),
+              // Simple-mode "complete" is a plain status flip and works
+              // fine offline; a table's Create Invoice is a real
+              // transaction (the fiscal boundary) and needs connectivity.
+              _createInvoiceButton(
+                enabled: !readOnly && t.lines.isNotEmpty && (t.tableId == null || isOnline),
+                blockedByOffline: t.tableId != null && !isOnline,
+                onComplete: onComplete,
               ),
               const SizedBox(height: 6),
               TextButton(
@@ -158,6 +170,19 @@ class CartPanel extends StatelessWidget {
         ),
       ],
     );
+  }
+
+  Widget _createInvoiceButton({
+    required bool enabled,
+    required bool blockedByOffline,
+    required VoidCallback onComplete,
+  }) {
+    final button = FilledButton(
+      onPressed: enabled ? onComplete : null,
+      child: const Text('Create Invoice'),
+    );
+    if (!blockedByOffline) return button;
+    return Tooltip(message: 'Offline — reconnect to close out this table', child: button);
   }
 }
 
